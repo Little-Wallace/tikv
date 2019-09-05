@@ -8,7 +8,6 @@ publish = false
 jemalloc = ["rocksdb/jemalloc"]
 portable = ["rocksdb/portable"]
 sse = ["rocksdb/sse"]
-update_titan = ["rocksdb/update_titan"]
 
 [dependencies]
 kvproto = { git = "https://github.com/pingcap/kvproto.git" }
@@ -34,8 +33,9 @@ rev = "b668f3911d6569de2e1e8b2672fccec1cc8298be"
 features = ["nightly", "push", "process"]
 
 [dependencies.rocksdb]
-git = "https://github.com/pingcap/rust-rocksdb.git"
+git = "https://github.com/Little-Wallace/rust-rocksdb.git"
 package = "rocksdb"
+branch = "multi_writebatch"
 
 [dev-dependencies]
 tempfile = "3.0"
