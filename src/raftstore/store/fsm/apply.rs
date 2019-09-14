@@ -2953,7 +2953,6 @@ mod tests {
     use crate::raftstore::store::msg::WriteResponse;
     use crate::raftstore::store::peer_storage::RAFT_INIT_LOG_INDEX;
     use crate::raftstore::store::util::{new_learner_peer, new_peer};
-    use engine::rocks::Writable;
     use engine::{WriteBatch, DB};
     use engine_rocks::RocksEngine;
     use kvproto::metapb::{self, RegionEpoch};
