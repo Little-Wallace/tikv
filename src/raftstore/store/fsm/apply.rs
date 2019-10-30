@@ -420,6 +420,7 @@ impl ApplyContext {
                     w.clear();
                 }
             }
+            self.kv_wb = 0;
             self.kv_wb_last_bytes = 0;
             self.kv_wb_last_keys = 0;
         }
