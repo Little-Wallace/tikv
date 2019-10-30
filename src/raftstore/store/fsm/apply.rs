@@ -554,7 +554,7 @@ fn should_write_to_engine(cmd: &RaftCmdRequest, kv_wb_count: usize) -> bool {
 
     // When write batch contains more than `recommended` keys, write the batch
     // to engine.
-    if kv_wb_count >= 16 {
+    if kv_wb_count >= 32 {
         return true;
     }
 
@@ -805,7 +805,7 @@ impl ApplyDelegate {
         if !data.is_empty() {
             let cmd = util::parse_data_at(data, index, &self.tag);
 
-            if should_write_to_engine(&cmd, apply_ctx.kv_wbs.len()) {
+            if should_write_to_engine(&cmd, apply_ctx.kv_wb) {
                 apply_ctx.commit(self);
             }
             apply_ctx.check_switch_write_batch();
