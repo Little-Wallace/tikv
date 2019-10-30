@@ -65,9 +65,6 @@ ENABLE_FEATURES += sse
 endif
 
 # Update Titan to latest master before build
-ifneq ($(UPDATE_TITAN), 0)
-ENABLE_FEATURES += update_titan
-endif
 
 ifeq ($(FAIL_POINT),1)
 ENABLE_FEATURES += failpoints
