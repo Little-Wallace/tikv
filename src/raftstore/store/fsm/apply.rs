@@ -288,6 +288,7 @@ struct ApplyContext {
 
     kv_wb: usize,
     kv_wbs: Vec<WriteBatch>,
+    kv_wb_keys: usize,
     kv_wb_last_bytes: u64,
     kv_wb_last_keys: u64,
 
@@ -326,6 +327,7 @@ impl ApplyContext {
             kv_wb: 0,
             cbs: MustConsumeVec::new("callback of apply context"),
             apply_res: vec![],
+            kv_wb_keys: 0,
             kv_wb_last_bytes: 0,
             kv_wb_last_keys: 0,
             last_applied_index: 0,
@@ -347,6 +349,7 @@ impl ApplyContext {
             let kv_wb = WriteBatch::with_capacity(DEFAULT_APPLY_WB_SIZE);
             self.kv_wbs.push(kv_wb);
             self.kv_wb = 0;
+            self.kv_wb_keys = 0;
             self.kv_wb_last_bytes = 0;
             self.kv_wb_last_keys = 0;
         }
@@ -390,6 +393,7 @@ impl ApplyContext {
                 let kv_wb = WriteBatch::with_capacity(DEFAULT_APPLY_WB_SIZE);
                 self.kv_wbs.push(kv_wb);
             }
+            self.kv_wb_keys += self.kv_wb().count();
             self.kv_wb += 1;
         }
         self.kv_wb_last_bytes = 0;
@@ -400,7 +404,7 @@ impl ApplyContext {
     /// If it returns true, all pending writes are persisted in engines.
     pub fn write_to_db(&mut self) -> bool {
         let need_sync = self.enable_sync_log && self.sync_log_hint;
-        if !self.kv_wbs.is_empty() {
+        if self.kv_wb > 0 {
             let mut write_opts = WriteOptions::new();
             write_opts.set_sync(need_sync);
             self.engines
@@ -421,6 +425,7 @@ impl ApplyContext {
                 }
             }
             self.kv_wb = 0;
+            self.kv_wb_keys = 0;
             self.kv_wb_last_bytes = 0;
             self.kv_wb_last_keys = 0;
         }
@@ -541,7 +546,7 @@ pub fn notify_stale_req(term: u64, cb: Callback) {
 }
 
 /// Checks if a write is needed to be issued before handling the command.
-fn should_write_to_engine(cmd: &RaftCmdRequest, kv_wb_count: usize) -> bool {
+fn should_write_to_engine(cmd: &RaftCmdRequest, kv_wb_count: usize, kv_wb_size: usize) -> bool {
     if cmd.has_admin_request() {
         match cmd.get_admin_request().get_cmd_type() {
             // ComputeHash require an up to date snapshot.
@@ -555,7 +560,7 @@ fn should_write_to_engine(cmd: &RaftCmdRequest, kv_wb_count: usize) -> bool {
 
     // When write batch contains more than `recommended` keys, write the batch
     // to engine.
-    if kv_wb_count >= 16 {
+    if kv_wb_count >= 12 || kv_wb_size >= 400 {
         return true;
     }
 
@@ -806,7 +811,7 @@ impl ApplyDelegate {
         if !data.is_empty() {
             let cmd = util::parse_data_at(data, index, &self.tag);
 
-            if should_write_to_engine(&cmd, apply_ctx.kv_wb) {
+            if should_write_to_engine(&cmd, apply_ctx.kv_wb, apply_ctx.kv_wb_keys) {
                 apply_ctx.commit(self);
             }
             apply_ctx.check_switch_write_batch();
