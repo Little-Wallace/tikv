@@ -404,7 +404,7 @@ impl ApplyContext {
     /// If it returns true, all pending writes are persisted in engines.
     pub fn write_to_db(&mut self) -> bool {
         let need_sync = self.enable_sync_log && self.sync_log_hint;
-        if self.kv_wb > 0 {
+        if !self.kv_wbs.is_empty() && !self.kv_wb().is_empty() {
             let mut write_opts = WriteOptions::new();
             write_opts.set_sync(need_sync);
             self.engines
