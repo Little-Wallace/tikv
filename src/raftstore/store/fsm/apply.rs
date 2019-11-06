@@ -555,7 +555,7 @@ fn should_write_to_engine(cmd: &RaftCmdRequest, kv_wb_count: usize) -> bool {
 
     // When write batch contains more than `recommended` keys, write the batch
     // to engine.
-    if kv_wb_count >= 32 {
+    if kv_wb_count >= 16 {
         return true;
     }
 
