@@ -288,7 +288,7 @@ struct ApplyContext {
 
     kv_wb: usize,
     kv_wbs: Vec<WriteBatch>,
-    kv_wb_keys: usize,
+    entry_num: usize,
     kv_wb_last_bytes: u64,
     kv_wb_last_keys: u64,
 
@@ -327,7 +327,7 @@ impl ApplyContext {
             kv_wb: 0,
             cbs: MustConsumeVec::new("callback of apply context"),
             apply_res: vec![],
-            kv_wb_keys: 0,
+            entry_num: 0,
             kv_wb_last_bytes: 0,
             kv_wb_last_keys: 0,
             last_applied_index: 0,
@@ -349,7 +349,7 @@ impl ApplyContext {
             let kv_wb = WriteBatch::with_capacity(DEFAULT_APPLY_WB_SIZE);
             self.kv_wbs.push(kv_wb);
             self.kv_wb = 0;
-            self.kv_wb_keys = 0;
+            self.entry_num = 0;
             self.kv_wb_last_bytes = 0;
             self.kv_wb_last_keys = 0;
         }
@@ -393,7 +393,6 @@ impl ApplyContext {
                 let kv_wb = WriteBatch::with_capacity(DEFAULT_APPLY_WB_SIZE);
                 self.kv_wbs.push(kv_wb);
             }
-            self.kv_wb_keys += self.kv_wb().count();
             self.kv_wb += 1;
         }
         self.kv_wb_last_bytes = 0;
@@ -425,7 +424,7 @@ impl ApplyContext {
                 }
             }
             self.kv_wb = 0;
-            self.kv_wb_keys = 0;
+            self.entry_num = 0;
             self.kv_wb_last_bytes = 0;
             self.kv_wb_last_keys = 0;
         }
@@ -560,7 +559,7 @@ fn should_write_to_engine(cmd: &RaftCmdRequest, kv_wb_count: usize, kv_wb_size: 
 
     // When write batch contains more than `recommended` keys, write the batch
     // to engine.
-    if kv_wb_count >= 12 || kv_wb_size >= 400 {
+    if kv_wb_count >= 16 || kv_wb_size >= 128 {
         return true;
     }
 
@@ -811,10 +810,10 @@ impl ApplyDelegate {
         if !data.is_empty() {
             let cmd = util::parse_data_at(data, index, &self.tag);
 
-            if should_write_to_engine(&cmd, apply_ctx.kv_wb, apply_ctx.kv_wb_keys) {
+            if should_write_to_engine(&cmd, apply_ctx.kv_wb, apply_ctx.entry_num) {
                 apply_ctx.commit(self);
             }
-            apply_ctx.check_switch_write_batch();
+            apply_ctx.entry_num += 1;
 
             return self.process_raft_cmd(apply_ctx, index, term, cmd);
         }
@@ -957,15 +956,20 @@ impl ApplyDelegate {
         assert!(!self.pending_remove);
 
         ctx.exec_ctx = Some(self.new_ctx(index, term));
+        let pos = ctx.kv_wb;
         ctx.kv_kv_wb_mut().set_save_point();
         let (resp, exec_result) = match self.exec_raft_cmd(ctx, req) {
             Ok(a) => {
-                ctx.kv_kv_wb_mut().pop_save_point().unwrap();
+                ctx.kv_wbs[pos].pop_save_point().unwrap();
                 a
             }
             Err(e) => {
                 // clear dirty values.
-                ctx.kv_kv_wb_mut().rollback_to_save_point().unwrap();
+                for i in pos..ctx.kv_wb {
+                    ctx.kv_wbs[i + 1].clear();
+                }
+                ctx.kv_wbs[pos].rollback_to_save_point().unwrap();
+                ctx.kv_wb = pos;
                 match e {
                     Error::EpochNotMatch(..) => debug!(
                         "epoch not match";
@@ -1116,7 +1120,7 @@ impl ApplyDelegate {
 
     fn exec_write_cmd(
         &mut self,
-        ctx: &ApplyContext,
+        ctx: &mut ApplyContext,
         req: &RaftCmdRequest,
     ) -> Result<(RaftCmdResponse, ApplyResult)> {
         fail_point!("on_apply_write_cmd", self.id() == 3, |_| {
@@ -1129,6 +1133,9 @@ impl ApplyDelegate {
         let mut ranges = vec![];
         let mut ssts = vec![];
         for req in requests {
+            if responses.len() % 4 == 0 {
+                ctx.check_switch_write_batch();
+            }
             let cmd_type = req.get_cmd_type();
             let mut resp = match cmd_type {
                 CmdType::Put => self.handle_put(ctx, req),
