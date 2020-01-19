@@ -315,6 +315,13 @@ impl TiKVServer {
         let db_path = self
             .store_path
             .join(Path::new(storage::config::DEFAULT_ROCKSDB_SUB_DIR));
+        if !self.config.rocksdb.hdd_store_dir.is_empty() {
+            let hdd_path = Path::new(&self.config.rocksdb.hdd_store_dir).to_owned();
+            kv_db_opts.set_db_paths(&[
+                (db_path.clone(), self.config.rocksdb.ssd_store_size.0),
+                (hdd_path, std::u64::MAX),
+            ]);
+        }
         let kv_engine =
             rocks::util::new_engine_opt(db_path.to_str().unwrap(), kv_db_opts, kv_cfs_opts)
                 .unwrap_or_else(|s| fatal!("failed to create kv engine: {}", s));
