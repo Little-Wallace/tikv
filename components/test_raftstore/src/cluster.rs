@@ -183,7 +183,7 @@ impl<T: Simulator> Cluster<T> {
     pub fn compact_data(&self) {
         for engine in self.engines.values() {
             let handle = rocks::util::get_cf_handle(&engine.kv, "default").unwrap();
-            rocks::util::compact_range(&engine.kv, handle, None, None, false, 1);
+            rocks::util::compact_range(&engine.kv, handle, None, None, false, 0, 1);
         }
     }
 

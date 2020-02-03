@@ -1380,6 +1380,14 @@ fn main() {
                         .default_value("default")
                         .possible_values(&["skip", "force", "default"])
                         .help("Set how to compact the bottommost level"),
+                )
+                .arg(
+                    Arg::with_name("target-path-id")
+                        .short("p")
+                        .long("target-path-id")
+                        .takes_value(true)
+                        .default_value("0")
+                        .help("select which path the output file of compaction is put in"),
                 ),
         )
         .subcommand(

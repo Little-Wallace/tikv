@@ -106,12 +106,14 @@ impl Runner {
         let compact_range_timer = COMPACT_RANGE_CF
             .with_label_values(&[cf_name])
             .start_coarse_timer();
+        let target_path_id = self.get_free_path_id();
         compact_range(
             &self.engine,
             handle,
             start_key,
             end_key,
             false,
+            target_path_id,
             1, /* threads */
         );
         compact_range_timer.observe_duration();
@@ -123,6 +125,11 @@ impl Runner {
             "time_takes" => ?timer.elapsed(),
         );
         Ok(())
+    }
+
+    fn get_free_path_id(&self) -> usize {
+        let opts = self.engine.get_db_options();
+        return opts.get_db_paths_num() - 1;
     }
 }
 
