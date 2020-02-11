@@ -14,11 +14,12 @@ use kvproto::raft_serverpb::{RaftApplyState, RaftMessage, RaftTruncatedState};
 use tempfile::{Builder, TempDir};
 
 use engine::rocks;
-use engine::rocks::DB;
+use engine::rocks::{DB, ColumnFamilyOptions, util::CFOptions};
 use engine::Engines;
 use engine::Peekable;
 use engine::CF_DEFAULT;
 use engine_rocks::RocksEngine;
+use keys::{REGION_RAFT_PREFIX_KEY, RAFT_LOG_SUFFIX};
 use pd_client::PdClient;
 use tikv::config::TiKvConfig;
 use tikv::raftstore::store::fsm::{create_raft_batch_system, PeerFsm, RaftBatchSystem, RaftRouter};
@@ -150,9 +151,13 @@ impl<T: Simulator> Cluster<T> {
                     .unwrap(),
             );
             let raft_path = dir.path().join("raft");
+
+            let opt = ColumnFamilyOptions::new();
+            let prefix = std::str::from_utf8(REGION_RAFT_PREFIX_KEY).unwrap();
+            opt.set_raft_skiplist(prefix, RAFT_LOG_SUFFIX);
             let raft_engine = Arc::new(
-                rocks::util::new_engine(raft_path.to_str().unwrap(), None, &[CF_DEFAULT], None)
-                    .unwrap(),
+                rocks::util::new_engine(raft_path.to_str().unwrap(), None, &[CF_DEFAULT],
+                                        Some(vec![CFOptions::new(CF_DEFAULT, opt)])).unwrap()
             );
             let engines = Engines::new(engine, raft_engine, cache.is_some());
             self.dbs.push(engines);

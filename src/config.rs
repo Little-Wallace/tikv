@@ -22,7 +22,7 @@ use kvproto::configpb::{self, StatusCode};
 use configuration::{ConfigChange, ConfigValue, Configuration};
 use engine::rocks::{
     BlockBasedOptions, Cache, ColumnFamilyOptions, CompactionPriority, DBCompactionStyle,
-    DBCompressionType, DBOptions, DBRateLimiterMode, DBRecoveryMode, LRUCacheOptions,
+    DBCompressionType, DBMemTableType, DBOptions, DBRateLimiterMode, DBRecoveryMode, LRUCacheOptions,
     TitanDBOptions,
 };
 use slog;
@@ -49,6 +49,7 @@ use engine::rocks::util::{
 };
 use engine::{CF_DEFAULT, CF_LOCK, CF_RAFT, CF_WRITE, DB};
 use keys::region_raft_prefix_len;
+use keys::{REGION_RAFT_PREFIX_KEY, RAFT_LOG_SUFFIX};
 use pd_client::{Config as PdConfig, ConfigClient};
 use tikv_util::config::{self, ReadableDuration, ReadableSize, GB, KB, MB};
 use tikv_util::future_pool;
@@ -202,7 +203,9 @@ macro_rules! cf_config {
             pub force_consistency_checks: bool,
             pub prop_size_index_distance: u64,
             pub prop_keys_index_distance: u64,
-            pub enable_doubly_skiplist: bool,
+            #[serde(with = "rocks_config::memtable_type_serde")]
+            #[config(skip)]
+            pub memtable_type: DBMemTableType,
             #[config(submodule)]
             pub titan: TitanCfConfig,
         }
@@ -312,9 +315,6 @@ macro_rules! write_into_metrics {
             .with_label_values(&[$tag, "force_consistency_checks"])
             .set(($cf.force_consistency_checks as i32).into());
         $metrics
-            .with_label_values(&[$tag, "enable_doubly_skiplist"])
-            .set(($cf.enable_doubly_skiplist as i32).into());
-        $metrics
             .with_label_values(&[$tag, "titan_min_blob_size"])
             .set($cf.titan.min_blob_size.0 as f64);
         $metrics
@@ -385,8 +385,11 @@ macro_rules! build_cf_opt {
         cf_opts.set_hard_pending_compaction_bytes_limit($opt.hard_pending_compaction_bytes_limit.0);
         cf_opts.set_optimize_filters_for_hits($opt.optimize_filters_for_hits);
         cf_opts.set_force_consistency_checks($opt.force_consistency_checks);
-        if $opt.enable_doubly_skiplist {
+        if $opt.memtable_type == DBMemTableType::DoublySkipList {
             cf_opts.set_doubly_skiplist();
+        } else if $opt.memtable_type == DBMemTableType::PrefixHashArray {
+            let prefix = std::str::from_utf8(REGION_RAFT_PREFIX_KEY).unwrap();
+            cf_opts.set_raft_skiplist(prefix, RAFT_LOG_SUFFIX);
         }
         cf_opts
     }};
@@ -437,7 +440,7 @@ impl Default for DefaultCfConfig {
             force_consistency_checks: true,
             prop_size_index_distance: DEFAULT_PROP_SIZE_INDEX_DISTANCE,
             prop_keys_index_distance: DEFAULT_PROP_KEYS_INDEX_DISTANCE,
-            enable_doubly_skiplist: true,
+            memtable_type: DBMemTableType::DoublySkipList,
             titan: TitanCfConfig::default(),
         }
     }
@@ -504,7 +507,7 @@ impl Default for WriteCfConfig {
             force_consistency_checks: true,
             prop_size_index_distance: DEFAULT_PROP_SIZE_INDEX_DISTANCE,
             prop_keys_index_distance: DEFAULT_PROP_KEYS_INDEX_DISTANCE,
-            enable_doubly_skiplist: true,
+            memtable_type: DBMemTableType::DoublySkipList,
             titan,
         }
     }
@@ -573,7 +576,7 @@ impl Default for LockCfConfig {
             force_consistency_checks: true,
             prop_size_index_distance: DEFAULT_PROP_SIZE_INDEX_DISTANCE,
             prop_keys_index_distance: DEFAULT_PROP_KEYS_INDEX_DISTANCE,
-            enable_doubly_skiplist: true,
+            memtable_type: DBMemTableType::DoublySkipList,
             titan,
         }
     }
@@ -632,7 +635,7 @@ impl Default for RaftCfConfig {
             force_consistency_checks: true,
             prop_size_index_distance: DEFAULT_PROP_SIZE_INDEX_DISTANCE,
             prop_keys_index_distance: DEFAULT_PROP_KEYS_INDEX_DISTANCE,
-            enable_doubly_skiplist: true,
+            memtable_type: DBMemTableType::DoublySkipList,
             titan,
         }
     }
@@ -921,7 +924,7 @@ impl Default for RaftDefaultCfConfig {
             force_consistency_checks: true,
             prop_size_index_distance: DEFAULT_PROP_SIZE_INDEX_DISTANCE,
             prop_keys_index_distance: DEFAULT_PROP_KEYS_INDEX_DISTANCE,
-            enable_doubly_skiplist: true,
+            memtable_type: DBMemTableType::PrefixHashArray,
             titan: TitanCfConfig::default(),
         }
     }
@@ -931,9 +934,11 @@ impl RaftDefaultCfConfig {
     pub fn build_opt(&self, cache: &Option<Cache>) -> ColumnFamilyOptions {
         let mut cf_opts = build_cf_opt!(self, cache);
         let f = Box::new(FixedPrefixSliceTransform::new(region_raft_prefix_len()));
-        cf_opts
-            .set_memtable_insert_hint_prefix_extractor("RaftPrefixSliceTransform", f)
-            .unwrap();
+        if self.memtable_type != DBMemTableType::PrefixHashArray {
+            cf_opts
+                .set_memtable_insert_hint_prefix_extractor("RaftPrefixSliceTransform", f)
+                .unwrap();
+        }
         cf_opts.set_titandb_options(&self.titan.build_opts());
         cf_opts
     }

@@ -37,6 +37,7 @@ features = ["nightly", "push", "process"]
 [dependencies.rocksdb]
 git = "https://github.com/tikv/rust-rocksdb.git"
 package = "rocksdb"
+branch = "raft_skiplist"
 
 [dev-dependencies]
 tempfile = "3.0"

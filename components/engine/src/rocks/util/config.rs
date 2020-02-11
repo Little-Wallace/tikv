@@ -251,6 +251,13 @@ numeric_enum_mod! {recovery_mode_serde DBRecoveryMode {
     SkipAnyCorruptedRecords = 3,
 }}
 
+numeric_enum_mod! {memtable_type_serde DBMemTableType {
+    InlineSkipList = 0,
+    DoublySkipList = 1,
+    PrefixHashArray = 2,
+}}
+
+
 #[cfg(test)]
 mod tests {
     use super::*;
