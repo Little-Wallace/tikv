@@ -1652,10 +1652,11 @@ mod tests {
     use crate::raftstore::store::worker::RegionTask;
     use crate::raftstore::store::{bootstrap_store, initial_region, prepare_bootstrap_cluster};
     use engine::rocks::util::new_engine;
-    use engine::rocks::WriteBatch;
-    use engine::Engines;
+    use engine::rocks::{ColumnFamilyOptions, WriteBatch, util::CFOptions};
+    use engine::{Engines, IterOption};
     use engine::{ALL_CFS, CF_DEFAULT};
     use kvproto::raft_serverpb::RaftSnapshotData;
+    use keys::{REGION_RAFT_PREFIX_KEY, RAFT_LOG_SUFFIX};
     use raft::eraftpb::HardState;
     use raft::eraftpb::{ConfState, Entry};
     use raft::{Error as RaftError, StorageError};
@@ -1674,8 +1675,13 @@ mod tests {
         let kv_db =
             Arc::new(new_engine(path.path().to_str().unwrap(), None, ALL_CFS, None).unwrap());
         let raft_path = path.path().join(Path::new("raft"));
+
+        let cf_opts = ColumnFamilyOptions::new();
+        let prefix = std::str::from_utf8(REGION_RAFT_PREFIX_KEY).unwrap();
+        cf_opts.set_raft_skiplist(prefix, RAFT_LOG_SUFFIX);
         let raft_db =
-            Arc::new(new_engine(raft_path.to_str().unwrap(), None, &[CF_DEFAULT], None).unwrap());
+            Arc::new(new_engine(raft_path.to_str().unwrap(), None, &[CF_DEFAULT],
+                                Some(vec![CFOptions::new(CF_DEFAULT, cf_opts)])).unwrap());
         let shared_block_cache = false;
         let engines = Engines::new(kv_db, raft_db, shared_block_cache);
         bootstrap_store(&engines, 1, 1).unwrap();
