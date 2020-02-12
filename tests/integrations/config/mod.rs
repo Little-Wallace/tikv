@@ -7,9 +7,7 @@ use std::path::PathBuf;
 use slog::Level;
 
 use engine::rocks::util::config::{BlobRunMode, CompressionType};
-use engine::rocks::{
-    CompactionPriority, DBCompactionStyle, DBCompressionType, DBRateLimiterMode, DBRecoveryMode,
-};
+use engine::rocks::{CompactionPriority, DBCompactionStyle, DBCompressionType, DBRateLimiterMode, DBRecoveryMode, DBMemTableType};
 use pd_client::Config as PdConfig;
 use tikv::config::*;
 use tikv::import::Config as ImportConfig;
@@ -262,7 +260,7 @@ fn test_serde_custom_tikv_config() {
             titan: titan_cf_config.clone(),
             prop_size_index_distance: 4000000,
             prop_keys_index_distance: 40000,
-            enable_doubly_skiplist: false,
+            memtable_type: DBMemTableType::DoublySkipList,
         },
         writecf: WriteCfConfig {
             block_size: ReadableSize::kb(12),
@@ -316,7 +314,7 @@ fn test_serde_custom_tikv_config() {
             },
             prop_size_index_distance: 4000000,
             prop_keys_index_distance: 40000,
-            enable_doubly_skiplist: true,
+            memtable_type: DBMemTableType::DoublySkipList,
         },
         lockcf: LockCfConfig {
             block_size: ReadableSize::kb(12),
@@ -370,7 +368,7 @@ fn test_serde_custom_tikv_config() {
             },
             prop_size_index_distance: 4000000,
             prop_keys_index_distance: 40000,
-            enable_doubly_skiplist: true,
+            memtable_type: DBMemTableType::DoublySkipList,
         },
         raftcf: RaftCfConfig {
             block_size: ReadableSize::kb(12),
@@ -424,7 +422,7 @@ fn test_serde_custom_tikv_config() {
             },
             prop_size_index_distance: 4000000,
             prop_keys_index_distance: 40000,
-            enable_doubly_skiplist: true,
+            memtable_type: DBMemTableType::DoublySkipList,
         },
         titan: titan_db_config.clone(),
     };
@@ -495,7 +493,7 @@ fn test_serde_custom_tikv_config() {
             titan: titan_cf_config,
             prop_size_index_distance: 4000000,
             prop_keys_index_distance: 40000,
-            enable_doubly_skiplist: true,
+            memtable_type: DBMemTableType::PrefixHashArray,
         },
         titan: titan_db_config,
     };

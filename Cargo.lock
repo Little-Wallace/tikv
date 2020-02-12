@@ -1905,7 +1905,7 @@ dependencies = [
 [[package]]
 name = "librocksdb_sys"
 version = "0.1.0"
-source = "git+https://github.com/Little-Wallace/rust-rocksdb.git?branch=raft_skiplist#22b08e82dfafc5d74e48f546502af25f4b435ac7"
+source = "git+https://github.com/Little-Wallace/rust-rocksdb.git?branch=raft_skiplist#d659f361f219f5ee28f43b1f86757a9e5cfc057f"
 dependencies = [
  "bindgen",
  "bzip2-sys",
@@ -1923,7 +1923,7 @@ dependencies = [
 [[package]]
 name = "libtitan_sys"
 version = "0.0.1"
-source = "git+https://github.com/Little-Wallace/rust-rocksdb.git?branch=raft_skiplist#22b08e82dfafc5d74e48f546502af25f4b435ac7"
+source = "git+https://github.com/Little-Wallace/rust-rocksdb.git?branch=raft_skiplist#d659f361f219f5ee28f43b1f86757a9e5cfc057f"
 dependencies = [
  "bzip2-sys",
  "cc",
@@ -3326,7 +3326,7 @@ checksum = "cabe4fa914dec5870285fa7f71f602645da47c486e68486d2b4ceb4a343e90ac"
 [[package]]
 name = "rocksdb"
 version = "0.3.0"
-source = "git+https://github.com/Little-Wallace/rust-rocksdb.git?branch=raft_skiplist#22b08e82dfafc5d74e48f546502af25f4b435ac7"
+source = "git+https://github.com/Little-Wallace/rust-rocksdb.git?branch=raft_skiplist#d659f361f219f5ee28f43b1f86757a9e5cfc057f"
 dependencies = [
  "libc",
  "librocksdb_sys",
