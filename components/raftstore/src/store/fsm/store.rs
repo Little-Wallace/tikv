@@ -704,6 +704,7 @@ impl<T: Transport, C: PdClient> PollHandler<PeerFsm, StoreFsm> for RaftPoller<T,
             .raft_metrics
             .process_ready
             .observe(duration_to_sec(self.timer.elapsed()) as f64);
+        self.poll_ctx.raft_metrics.poll_batch_size.observe(peers.len() as f64);
         self.poll_ctx.raft_metrics.flush();
         self.poll_ctx.store_stat.flush();
     }

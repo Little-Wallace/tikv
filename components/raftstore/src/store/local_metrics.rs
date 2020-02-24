@@ -420,6 +420,7 @@ pub struct RaftMetrics {
     pub process_ready: LocalHistogram,
     pub append_log: LocalHistogram,
     pub commit_log: LocalHistogram,
+    pub poll_batch_size: LocalHistogram,
     pub leader_missing: Arc<Mutex<HashSet<u64>>>,
     pub invalid_proposal: RaftInvalidProposeMetrics,
 }
@@ -433,6 +434,9 @@ impl Default for RaftMetrics {
             propose: Default::default(),
             process_ready: PEER_RAFT_PROCESS_DURATION
                 .with_label_values(&["ready"])
+                .local(),
+            poll_batch_size: PEER_RAFT_POLL_BATCH_SIZE
+                .with_label_values(&["raft"])
                 .local(),
             append_log: PEER_APPEND_LOG_HISTOGRAM.local(),
             commit_log: PEER_COMMIT_LOG_HISTOGRAM.local(),
@@ -453,6 +457,7 @@ impl RaftMetrics {
         self.commit_log.flush();
         self.message_dropped.flush();
         self.invalid_proposal.flush();
+        self.poll_batch_size.flush();
         let mut missing = self.leader_missing.lock().unwrap();
         LEADER_MISSING.set(missing.len() as i64);
         missing.clear();

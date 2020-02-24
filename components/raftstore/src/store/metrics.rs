@@ -88,6 +88,14 @@ lazy_static! {
             exponential_buckets(0.0005, 2.0, 20).unwrap()
         ).unwrap();
 
+    pub static ref PEER_RAFT_POLL_BATCH_SIZE: HistogramVec =
+        register_histogram_vec!(
+            "tikv_raftstore_raft_poll_batch_size",
+            "Bucketed histogram of size of batch each time calling poll",
+            &["type"],
+            exponential_buckets(1.0, 2.0, 13).unwrap()
+        ).unwrap();
+
     pub static ref PEER_PROPOSE_LOG_SIZE_HISTOGRAM: Histogram =
         register_histogram!(
             "tikv_raftstore_propose_log_size",
