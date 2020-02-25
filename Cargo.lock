@@ -372,8 +372,8 @@ checksum = "10004c15deb332055f7a4a208190aed362cf9a7c2f6ab70a305fba50e1105f38"
 
 [[package]]
 name = "bzip2-sys"
-version = "0.1.7"
-source = "git+https://github.com/alexcrichton/bzip2-rs.git#a8ee5cb4d0587409d03b4367bbfa8d7d6266378e"
+version = "0.1.8+1.0.8"
+source = "git+https://github.com/alexcrichton/bzip2-rs.git#461d66916a5e6848e455c6d4fb9a5f70f4617efd"
 dependencies = [
  "cc",
  "libc",
@@ -1932,7 +1932,7 @@ dependencies = [
 [[package]]
 name = "librocksdb_sys"
 version = "0.1.0"
-source = "git+https://github.com/tikv/rust-rocksdb.git#0502db094849f4db45678d4473f2ceb4fb915f8b"
+source = "git+https://github.com/Little-Wallace/rust-rocksdb.git?branch=tpcc-perf#03b4ad6599e04265843407f7fae04db32f8e62fe"
 dependencies = [
  "bindgen",
  "bzip2-sys",
@@ -1950,7 +1950,7 @@ dependencies = [
 [[package]]
 name = "libtitan_sys"
 version = "0.0.1"
-source = "git+https://github.com/tikv/rust-rocksdb.git#0502db094849f4db45678d4473f2ceb4fb915f8b"
+source = "git+https://github.com/Little-Wallace/rust-rocksdb.git?branch=tpcc-perf#03b4ad6599e04265843407f7fae04db32f8e62fe"
 dependencies = [
  "bzip2-sys",
  "cc",
@@ -3431,7 +3431,7 @@ checksum = "cabe4fa914dec5870285fa7f71f602645da47c486e68486d2b4ceb4a343e90ac"
 [[package]]
 name = "rocksdb"
 version = "0.3.0"
-source = "git+https://github.com/tikv/rust-rocksdb.git#0502db094849f4db45678d4473f2ceb4fb915f8b"
+source = "git+https://github.com/Little-Wallace/rust-rocksdb.git?branch=tpcc-perf#03b4ad6599e04265843407f7fae04db32f8e62fe"
 dependencies = [
  "libc",
  "librocksdb_sys",
