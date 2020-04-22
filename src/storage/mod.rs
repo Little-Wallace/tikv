@@ -497,7 +497,7 @@ impl<E: Engine, L: LockManager> Storage<E, L> {
     pub fn sched_txn_command<T: StorageCallbackType>(
         &self,
         cmd: TypedCommand<T>,
-        callback: Callback<T>,
+        callback: Option<Callback<T>>,
     ) -> Result<()> {
         use crate::storage::txn::commands::{
             AcquirePessimisticLock, CommandKind, Prewrite, PrewritePessimistic,
@@ -506,38 +506,37 @@ impl<E: Engine, L: LockManager> Storage<E, L> {
         let cmd: Command = cmd.into();
 
         if cmd.requires_pessimistic_txn() && !self.pessimistic_txn_enabled {
-            callback(Err(Error::from(ErrorInner::PessimisticTxnNotEnabled)));
+            callback.map(|cb| cb(Err(Error::from(ErrorInner::PessimisticTxnNotEnabled))));
             return Ok(());
         }
-
-        match &cmd.kind {
-            CommandKind::Prewrite(Prewrite { mutations, .. }) => {
-                check_key_size!(
-                    mutations.iter().map(|m| m.key().as_encoded()),
-                    self.max_key_size,
-                    callback
-                );
+        if let Some(cb) = callback {
+            match &cmd.kind {
+                CommandKind::Prewrite(Prewrite { mutations, .. }) => {
+                    check_key_size!(
+                        mutations.iter().map(|m| m.key().as_encoded()),
+                        self.max_key_size,
+                        cb
+                    );
+                }
+                CommandKind::PrewritePessimistic(PrewritePessimistic { mutations, .. }) => {
+                    check_key_size!(
+                        mutations.iter().map(|(m, _)| m.key().as_encoded()),
+                        self.max_key_size,
+                        cb
+                    );
+                }
+                CommandKind::AcquirePessimisticLock(AcquirePessimisticLock { keys, .. }) => {
+                    check_key_size!(keys.iter().map(|k| k.0.as_encoded()), self.max_key_size, cb);
+                }
+                _ => {}
             }
-            CommandKind::PrewritePessimistic(PrewritePessimistic { mutations, .. }) => {
-                check_key_size!(
-                    mutations.iter().map(|(m, _)| m.key().as_encoded()),
-                    self.max_key_size,
-                    callback
-                );
-            }
-            CommandKind::AcquirePessimisticLock(AcquirePessimisticLock { keys, .. }) => {
-                check_key_size!(
-                    keys.iter().map(|k| k.0.as_encoded()),
-                    self.max_key_size,
-                    callback
-                );
-            }
-            _ => {}
+            fail_point!("storage_drop_message", |_| Ok(()));
+            cmd.incr_cmd_metric();
+            self.sched.run_cmd(cmd, Some(T::callback(cb)));
+        } else {
+            cmd.incr_cmd_metric();
+            self.sched.run_cmd(cmd, None);
         }
-
-        fail_point!("storage_drop_message", |_| Ok(()));
-        cmd.incr_cmd_metric();
-        self.sched.run_cmd(cmd, T::callback(callback));
 
         Ok(())
     }
@@ -1363,7 +1362,7 @@ mod tests {
                     b"x".to_vec(),
                     100.into(),
                 ),
-                expect_ok_callback(tx.clone(), 1),
+                Some(expect_ok_callback(tx.clone(), 1)),
             )
             .unwrap();
         rx.recv().unwrap();
@@ -1386,7 +1385,7 @@ mod tests {
                     101.into(),
                     Context::default(),
                 ),
-                expect_ok_callback(tx, 3),
+                Some(expect_ok_callback(tx, 3)),
             )
             .unwrap();
         rx.recv().unwrap();
@@ -1420,14 +1419,14 @@ mod tests {
                     b"a".to_vec(),
                     1.into(),
                 ),
-                expect_fail_callback(tx, 0, |e| match e {
+                Some(expect_fail_callback(tx, 0, |e| match e {
                     Error(box ErrorInner::Txn(TxnError(box TxnErrorInner::Mvcc(mvcc::Error(
                         box mvcc::ErrorInner::Engine(EngineError(box EngineErrorInner::Request(
                             ..,
                         ))),
                     ))))) => {}
                     e => panic!("unexpected error chain: {:?}", e),
-                }),
+                })),
             )
             .unwrap();
         rx.recv().unwrap();
@@ -1513,7 +1512,7 @@ mod tests {
                     b"a".to_vec(),
                     1.into(),
                 ),
-                expect_ok_callback(tx.clone(), 0),
+                Some(expect_ok_callback(tx.clone(), 0)),
             )
             .unwrap();
         rx.recv().unwrap();
@@ -1620,7 +1619,7 @@ mod tests {
                     2.into(),
                     Context::default(),
                 ),
-                expect_ok_callback(tx, 1),
+                Some(expect_ok_callback(tx, 1)),
             )
             .unwrap();
         rx.recv().unwrap();
@@ -1752,7 +1751,7 @@ mod tests {
                     b"a".to_vec(),
                     1.into(),
                 ),
-                expect_ok_callback(tx.clone(), 0),
+                Some(expect_ok_callback(tx.clone(), 0)),
             )
             .unwrap();
         rx.recv().unwrap();
@@ -1778,7 +1777,7 @@ mod tests {
                     2.into(),
                     Context::default(),
                 ),
-                expect_ok_callback(tx, 1),
+                Some(expect_ok_callback(tx, 1)),
             )
             .unwrap();
         rx.recv().unwrap();

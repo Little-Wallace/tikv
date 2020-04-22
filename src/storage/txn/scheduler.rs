@@ -139,7 +139,7 @@ impl Drop for CmdTimer {
 }
 
 impl TaskContext {
-    fn new(task: Task, latches: &Latches, cb: StorageCallback) -> TaskContext {
+    fn new(task: Task, latches: &Latches, cb: Option<StorageCallback>) -> TaskContext {
         let tag = task.cmd().tag();
         let lock = task.cmd().gen_lock(latches);
         // Write command should acquire write lock.
@@ -155,7 +155,7 @@ impl TaskContext {
         TaskContext {
             task: Some(task),
             lock,
-            cb: Some(cb),
+            cb,
             write_bytes,
             tag,
             latch_timer: Instant::now_coarse(),
@@ -219,7 +219,7 @@ impl<L: LockManager> SchedulerInner<L> {
         task
     }
 
-    fn enqueue_task(&self, task: Task, callback: StorageCallback) {
+    fn enqueue_task(&self, task: Task, callback: Option<StorageCallback>) {
         let cid = task.cid;
         let tctx = TaskContext::new(task, &self.latches, callback);
 
@@ -327,7 +327,7 @@ impl<E: Engine, L: LockManager> Scheduler<E, L> {
         }
     }
 
-    pub fn run_cmd(&self, cmd: Command, callback: StorageCallback) {
+    pub fn run_cmd(&self, cmd: Command, callback: Option<StorageCallback>) {
         self.on_receive_new_cmd(cmd, callback);
     }
 }
@@ -359,7 +359,7 @@ impl<E: Engine, L: LockManager> Scheduler<E, L> {
         }
     }
 
-    fn schedule_command(&self, cmd: Command, callback: StorageCallback) {
+    fn schedule_command(&self, cmd: Command, callback: Option<StorageCallback>) {
         let cid = self.inner.gen_id();
         debug!("received new command"; "cid" => cid, "cmd" => ?cmd);
 
@@ -383,12 +383,14 @@ impl<E: Engine, L: LockManager> Scheduler<E, L> {
         }
     }
 
-    fn on_receive_new_cmd(&self, cmd: Command, callback: StorageCallback) {
+    fn on_receive_new_cmd(&self, cmd: Command, callback: Option<StorageCallback>) {
         // write flow control
         if cmd.need_flow_control() && self.inner.too_busy() {
             SCHED_TOO_BUSY_COUNTER_VEC.get(cmd.tag()).inc();
-            callback.execute(ProcessResult::Failed {
-                err: StorageError::from(StorageErrorInner::SchedTooBusy),
+            callback.map(|cb| {
+                cb.execute(ProcessResult::Failed {
+                    err: StorageError::from(StorageErrorInner::SchedTooBusy),
+                })
             });
             return;
         }
@@ -437,7 +439,7 @@ impl<E: Engine, L: LockManager> Scheduler<E, L> {
         let pr = ProcessResult::Failed {
             err: StorageError::from(err),
         };
-        tctx.cb.unwrap().execute(pr);
+        tctx.cb.map(|cb| cb.execute(pr));
 
         self.release_lock(&tctx.lock, cid);
     }
@@ -453,7 +455,7 @@ impl<E: Engine, L: LockManager> Scheduler<E, L> {
         let tctx = self.inner.dequeue_task_context(cid);
         if let ProcessResult::NextCommand { cmd } = pr {
             SCHED_STAGE_COUNTER_VEC.get(tag).next_cmd.inc();
-            self.schedule_command(cmd, tctx.cb.unwrap());
+            self.schedule_command(cmd, tctx.cb);
         } else {
             tctx.cb.unwrap().execute(pr);
         }
@@ -492,12 +494,10 @@ impl<E: Engine, L: LockManager> Scheduler<E, L> {
             };
             if let ProcessResult::NextCommand { cmd } = pr {
                 SCHED_STAGE_COUNTER_VEC.get(tag).next_cmd.inc();
-                self.schedule_command(cmd, cb);
+                self.schedule_command(cmd, Some(cb));
             } else {
                 cb.execute(pr);
             }
-        } else {
-            assert!(pipelined);
         }
 
         self.release_lock(&tctx.lock, cid);

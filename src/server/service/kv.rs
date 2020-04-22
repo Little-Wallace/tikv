@@ -1,6 +1,5 @@
 // Copyright 2017 TiKV Project Authors. Licensed under Apache-2.0.
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tikv_util::time::{duration_to_sec, Instant};
@@ -9,7 +8,6 @@ use crate::coprocessor::Endpoint;
 use crate::server::gc_worker::GcWorker;
 use crate::server::load_statistics::ThreadLoad;
 use crate::server::metrics::*;
-use crate::server::service::batch::ReqBatcher;
 use crate::server::snap::Task as SnapTask;
 use crate::server::Error;
 use crate::storage::{
@@ -831,87 +829,33 @@ impl<T: RaftStoreRouter<RocksEngine> + 'static, E: Engine, L: LockManager> Tikv
         let storage = self.storage.clone();
         let cop = self.cop.clone();
         let gc_worker = self.gc_worker.clone();
-        if self.enable_req_batch {
-            let stopped = Arc::new(AtomicBool::new(false));
-            let req_batcher = ReqBatcher::new(
-                tx.clone(),
-                self.req_batch_wait_duration,
-                Arc::clone(&self.readpool_normal_thread_load),
-            );
-            let req_batcher = Arc::new(Mutex::new(req_batcher));
-            if let Some(duration) = self.req_batch_wait_duration {
-                let storage = storage.clone();
-                let req_batcher = req_batcher.clone();
-                let req_batcher2 = req_batcher.clone();
-                let stopped = Arc::clone(&stopped);
-                let start = std::time::Instant::now();
-                let timer = GLOBAL_TIMER_HANDLE.clone();
-                self.timer_pool.lock().unwrap().spawn(
-                    timer
-                        .interval(start, duration)
-                        .take_while(move |_| {
-                            // only stop timer when no more incoming and old batch is submitted.
-                            future::ok(
-                                !stopped.load(Ordering::Relaxed)
-                                    || !req_batcher2.lock().unwrap().is_empty(),
-                            )
-                        })
-                        .for_each(move |_| {
-                            req_batcher.lock().unwrap().should_submit(&storage);
-                            Ok(())
-                        })
-                        .map_err(|e| error!("batch_commands timer errored"; "err" => ?e)),
+        let request_handler = stream.for_each(move |mut req| {
+            let request_ids = req.take_request_ids();
+            let requests: Vec<_> = req.take_requests().into();
+            GRPC_REQ_BATCH_COMMANDS_SIZE.observe(requests.len() as f64);
+            for (id, req) in request_ids.into_iter().zip(requests) {
+                if id == 0 {
+                    match req.cmd {
+                        Some(batch_commands_request::request::Cmd::Commit(req)) => {
+                            let _ = storage.sched_txn_command(req.into(), None);
+                        }
+                        _ => (),
+                    }
+                    continue;
+                }
+                handle_batch_commands_request(
+                    &storage,
+                    &gc_worker,
+                    &cop,
+                    &peer,
+                    id,
+                    req,
+                    tx.clone(),
                 );
             }
-            let request_handler = stream.for_each(move |mut req| {
-                let request_ids = req.take_request_ids();
-                let requests: Vec<_> = req.take_requests().into();
-                GRPC_REQ_BATCH_COMMANDS_SIZE.observe(requests.len() as f64);
-                for (id, mut req) in request_ids.into_iter().zip(requests) {
-                    if !req_batcher.lock().unwrap().filter(id, &mut req) {
-                        handle_batch_commands_request(
-                            &storage,
-                            &gc_worker,
-                            &cop,
-                            &peer,
-                            id,
-                            req,
-                            tx.clone(),
-                        );
-                    }
-                }
-                req_batcher.lock().unwrap().maybe_submit(&storage);
-                future::ok(())
-            });
-            ctx.spawn(
-                request_handler
-                    .map_err(|e| error!("batch_commands error"; "err" => %e))
-                    .and_then(move |_| {
-                        // signal timer guard to stop polling
-                        stopped.store(true, Ordering::Relaxed);
-                        Ok(())
-                    }),
-            );
-        } else {
-            let request_handler = stream.for_each(move |mut req| {
-                let request_ids = req.take_request_ids();
-                let requests: Vec<_> = req.take_requests().into();
-                GRPC_REQ_BATCH_COMMANDS_SIZE.observe(requests.len() as f64);
-                for (id, req) in request_ids.into_iter().zip(requests) {
-                    handle_batch_commands_request(
-                        &storage,
-                        &gc_worker,
-                        &cop,
-                        &peer,
-                        id,
-                        req,
-                        tx.clone(),
-                    );
-                }
-                future::ok(())
-            });
-            ctx.spawn(request_handler.map_err(|e| error!("batch_commands error"; "err" => %e)));
-        };
+            future::ok(())
+        });
+        ctx.spawn(request_handler.map_err(|e| error!("batch_commands error"; "err" => %e)));
 
         let thread_load = Arc::clone(&self.grpc_thread_load);
         let response_retriever = BatchReceiver::new(
@@ -1653,7 +1597,7 @@ macro_rules! txn_command_future {
         ) -> impl Future<Item = $resp_ty, Error = Error> {
             $prelude
             let (cb, f) = paired_future_callback();
-            let res = storage.sched_txn_command($req.into(), cb);
+            let res = storage.sched_txn_command($req.into(), Some(cb));
 
             AndThenWith::new(res, f.map_err(Error::from)).map(move |$v| {
                 let mut $resp = $resp_ty::default();
