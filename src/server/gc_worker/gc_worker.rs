@@ -8,10 +8,11 @@ use std::sync::{atomic, Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use engine_rocks::RocksEngine;
-use engine_traits::{MiscExt, TablePropertiesExt};
-use engine_traits::{CF_DEFAULT, CF_LOCK, CF_WRITE};
+use engine_traits::{MiscExt, TablePropertiesExt, Iterable};
+use engine_traits::{CF_DEFAULT, CF_RAFT, CF_LOCK, CF_WRITE};
 use futures::Future;
 use kvproto::kvrpcpb::{Context, IsolationLevel, LockInfo};
+use kvproto::raft_serverpb::{PeerState, RegionLocalState};
 use kvproto::metapb;
 use tokio_core::reactor::Handle;
 
@@ -402,6 +403,73 @@ impl<E: Engine> GcRunner<E> {
         Ok(())
     }
 
+    fn delete_overlap_regions(
+        &self,
+        local_storage: &RocksEngine,
+        start_data_key: Vec<u8>,
+        end_data_key: Vec<u8>,
+    ) {
+        let mut results = vec![];
+        let mut region_ranges = vec![];
+
+        let _ = local_storage.scan_cf(
+            CF_RAFT,
+            keys::REGION_META_MIN_KEY,
+            keys::REGION_META_MAX_KEY,
+            false,
+            |key, value| {
+                let (_, suffix) = box_try!(keys::decode_region_meta_key(key));
+                if suffix != keys::REGION_STATE_SUFFIX {
+                    return Ok(true);
+                }
+                let local_state = protobuf::parse_from_bytes::<RegionLocalState>(value)?;
+                let region = local_state.get_region();
+                if local_state.get_state() == PeerState::Tombstone {
+                    return Ok(true);
+                }
+                if local_state.get_state() == PeerState::Applying {
+                    return Ok(true);
+                }
+                if local_state.get_state() == PeerState::Merging {
+                    return Ok(true);
+                }
+                let key = keys::enc_end_key(region);
+                if key > start_data_key && key < end_data_key {
+                    region_ranges.push(key);
+                }
+                Ok(true)
+            },
+        );
+        region_ranges.sort();
+        const DELETE_REGION_LIMIT: usize = 8;
+        let l = region_ranges.len() / DELETE_REGION_LIMIT;
+        if l < 2 {
+            return;
+        } else {
+            let mut last_key = start_data_key.clone();
+            for i in 1..l {
+                results.push((last_key, region_ranges[i * DELETE_REGION_LIMIT].clone()));
+                last_key = region_ranges[i * DELETE_REGION_LIMIT].clone();
+            }
+            results.push((last_key, end_data_key));
+            let cfs = &[CF_DEFAULT, CF_WRITE];
+            for cf in cfs {
+                for (range_start, range_end) in &results {
+                    let _ = local_storage.delete_files_in_range_cf(
+                        cf,
+                        range_start,
+                        range_end,
+                        false,
+                    );
+                }
+            }
+            info!(
+                "unsafe destroy range finished deleting regions in range";
+                "region_count" => region_ranges.len()
+            );
+        }
+    }
+
     fn unsafe_destroy_range(&self, _: &Context, start_key: &Key, end_key: &Key) -> Result<()> {
         info!(
             "unsafe destroy range started";
@@ -426,6 +494,7 @@ impl<E: Engine> GcRunner<E> {
 
         // First, call delete_files_in_range to free as much disk space as possible
         let delete_files_start_time = Instant::now();
+        self.delete_overlap_regions(local_storage, start_data_key.clone(), end_data_key.clone());
         for cf in cfs {
             local_storage
                 .delete_files_in_range_cf(cf, &start_data_key, &end_data_key, false)
