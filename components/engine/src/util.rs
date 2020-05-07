@@ -37,9 +37,9 @@ pub fn check_key_in_range(
 
 // In our tests, we found that if the batch size is too large, running delete_all_in_range will
 // reduce OLTP QPS by 30% ~ 60%. We found that 32K is a proper choice.
-pub const MAX_DELETE_BATCH_SIZE: usize = 4096;
+pub const MAX_DELETE_BATCH_SIZE: usize = 256;
 #[cfg(not(test))]
-const DELETE_KEYS_SST_LIMIT: usize = 1024 * 32;
+const DELETE_KEYS_SST_LIMIT: usize = 1024 * 8;
 #[cfg(test)]
 const DELETE_KEYS_SST_LIMIT: usize = 2;
 
@@ -92,7 +92,7 @@ pub fn delete_all_in_range_cf(
                     let mut s = DefaultHasher::new();
                     start_key.hash(&mut s);
                     let name = s.finish().to_string();
-                    writer = Some(create_sst_writer(db, cf, name)?);
+                    writer.replace(create_sst_writer(db, cf, name)?);
                     for key in data.iter() {
                         writer.as_mut().unwrap().delete(key)?;
                     }
@@ -111,7 +111,7 @@ pub fn delete_all_in_range_cf(
             let wb = WriteBatch::new();
             for key in data.iter() {
                 wb.delete(key);
-                if wb.data_size() > MAX_DELETE_BATCH_SIZE {
+                if wb.count() > MAX_DELETE_BATCH_SIZE {
                     db.write(&wb)?;
                     wb.clear();
                 }
@@ -119,6 +119,7 @@ pub fn delete_all_in_range_cf(
             if wb.count() > 0 {
                 db.write(&wb)?;
             }
+            db.sync_wal()?;
         }
         if let Some(mut w) = writer {
             let f = w.finish()?;
@@ -233,7 +234,7 @@ mod tests {
         // Delete all in ["k2", "k4").
         let start = b"k2";
         let end = b"k4";
-        delete_all_in_range(&db, start, end, use_delete_range).unwrap();
+        delete_all_in_range(&db, start, end, use_delete_range, None).unwrap();
         check_data(&db, ALL_CFS, kvs_left.as_slice());
     }
 
@@ -319,7 +320,7 @@ mod tests {
         check_data(&db, &[cf], kvs.as_slice());
 
         // Delete all in ["k2", "k4").
-        delete_all_in_range(&db, b"kabcdefg2", b"kabcdefg4", true).unwrap();
+        delete_all_in_range(&db, b"kabcdefg2", b"kabcdefg4", true, None).unwrap();
         check_data(&db, &[cf], kvs_left.as_slice());
     }
 }
