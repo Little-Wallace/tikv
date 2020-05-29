@@ -110,7 +110,7 @@ pub fn delete_all_in_range_cf(
         if data.len() > 0 {
             let wb = WriteBatch::new();
             for key in data.iter() {
-                wb.delete(key);
+                wb.delete_cf(handle, key);
                 if wb.count() > MAX_DELETE_BATCH_SIZE {
                     db.write(&wb)?;
                     wb.clear();
