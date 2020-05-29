@@ -110,7 +110,7 @@ pub fn delete_all_in_range_cf(
         if data.len() > 0 {
             let wb = WriteBatch::new();
             for key in data.iter() {
-                wb.delete_cf(handle, key);
+                wb.delete_cf(handle, key).unwrap();
                 if wb.count() > MAX_DELETE_BATCH_SIZE {
                     db.write(&wb)?;
                     wb.clear();
@@ -234,7 +234,7 @@ mod tests {
         // Delete all in ["k2", "k4").
         let start = b"k2";
         let end = b"k4";
-        delete_all_in_range(&db, start, end, use_delete_range, None).unwrap();
+        delete_all_in_range(&db, start, end, use_delete_range).unwrap();
         check_data(&db, ALL_CFS, kvs_left.as_slice());
     }
 
@@ -320,7 +320,7 @@ mod tests {
         check_data(&db, &[cf], kvs.as_slice());
 
         // Delete all in ["k2", "k4").
-        delete_all_in_range(&db, b"kabcdefg2", b"kabcdefg4", true, None).unwrap();
+        delete_all_in_range(&db, b"kabcdefg2", b"kabcdefg4", true).unwrap();
         check_data(&db, &[cf], kvs_left.as_slice());
     }
 }
