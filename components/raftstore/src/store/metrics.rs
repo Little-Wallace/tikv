@@ -475,4 +475,12 @@ lazy_static! {
             "The number of pending entries in the channel of apply FSMs."
     )
     .unwrap();
+
+    pub static ref FSM_BATCH_SIZE_HISTOGRAM: HistogramVec =
+      register_histogram_vec!(
+            "tikv_raftstore_store_fsm_batch_size_duration_secs",
+            "Bucketed histogram of request wait time duration",
+            &["type"],
+            exponential_buckets(1.0, 2.0, 20).unwrap()
+    ).unwrap();
 }

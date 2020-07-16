@@ -743,6 +743,12 @@ impl<T: Transport, C: PdClient> PollHandler<PeerFsm<RocksSnapshot>, StoreFsm> fo
     }
 
     fn end(&mut self, peers: &mut [Box<PeerFsm<RocksSnapshot>>]) {
+        FSM_BATCH_SIZE_HISTOGRAM
+            .with_label_values(&["raft_write_count"])
+            .observe(self.poll_ctx.kv_wb.count() as f64);
+        FSM_BATCH_SIZE_HISTOGRAM
+            .with_label_values(&["raft_batch_count"])
+            .observe(peers.len() as f64);
         if self.poll_ctx.has_ready {
             self.handle_raft_ready(peers);
         }

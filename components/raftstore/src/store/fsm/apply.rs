@@ -375,6 +375,7 @@ where
 
     // TxnExtra collected from applied cmds.
     txn_extras: MustConsumeVec<TxnExtra>,
+    write_count: usize,
 }
 
 impl<E, W> ApplyContext<E, W>
@@ -408,6 +409,7 @@ where
             kv_wb_last_keys: 0,
             last_applied_index: 0,
             committed_count: 0,
+            write_count: 0,
             enable_sync_log: cfg.sync_log,
             sync_log_hint: false,
             exec_ctx: None,
@@ -505,6 +507,7 @@ where
             }
             self.kv_wb_last_bytes = 0;
             self.kv_wb_last_keys = 0;
+            self.write_count += 1;
         }
         // Call it before invoking callback for preventing Commit is executed before Prewrite is observed.
         self.host
@@ -3125,6 +3128,7 @@ where
             self.apply_ctx.enable_sync_log = incoming.sync_log;
         }
         self.apply_ctx.perf_context_statistics.start();
+        self.apply_ctx.write_count = 0;
     }
 
     /// There is no control fsm in apply poller.
@@ -3183,6 +3187,12 @@ where
 
     fn end(&mut self, fsms: &mut [Box<ApplyFsm<E>>]) {
         let is_synced = self.apply_ctx.flush();
+        FSM_BATCH_SIZE_HISTOGRAM
+            .with_label_values(&["apply_write_times"])
+            .observe(self.apply_ctx.write_count as f64);
+        FSM_BATCH_SIZE_HISTOGRAM
+            .with_label_values(&["apply_batch_count"])
+            .observe(fsms.len() as f64);
         if is_synced {
             for fsm in fsms {
                 fsm.delegate.last_sync_apply_index = fsm.delegate.apply_state.get_applied_index();
