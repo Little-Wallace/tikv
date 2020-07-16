@@ -4,17 +4,19 @@ use kvproto::raft_serverpb::RaftMessage;
 use raft::eraftpb::MessageType;
 use std::sync::{Arc, RwLock};
 
+use super::{Config, Result};
 use crate::server::metrics::*;
-use crate::server::raft_client::RaftClient;
+use crate::server::raft_client::{Conn, RaftClient};
 use crate::server::resolve::StoreAddrResolver;
 use crate::server::snap::Task as SnapTask;
-use crate::server::Result;
+use crossbeam::channel::SendError;
 use engine_rocks::RocksSnapshot;
 use raft::SnapshotStatus;
 use raftstore::router::RaftStoreRouter;
 use raftstore::store::Transport;
 use raftstore::Result as RaftStoreResult;
 use tikv_util::collections::HashSet;
+use tikv_util::collections::{HashMap, HashMapEntry};
 use tikv_util::worker::Scheduler;
 use tikv_util::HandyRwLock;
 
@@ -27,6 +29,8 @@ where
     snap_scheduler: Scheduler<SnapTask>,
     pub raft_router: T,
     resolving: Arc<RwLock<HashSet<u64>>>,
+    conns: HashMap<(u64, u64), Conn>,
+    cfg: Arc<Config>,
     resolver: S,
 }
 
@@ -42,6 +46,9 @@ where
             raft_router: self.raft_router.clone(),
             resolving: Arc::clone(&self.resolving),
             resolver: self.resolver.clone(),
+            // do not clone connection caches
+            conns: HashMap::default(),
+            cfg: self.cfg.clone(),
         }
     }
 }
@@ -55,16 +62,19 @@ impl<T: RaftStoreRouter<RocksSnapshot> + 'static, S: StoreAddrResolver + 'static
         raft_router: T,
         resolver: S,
     ) -> ServerTransport<T, S> {
+        let cfg = raft_client.rl().cfg.clone();
         ServerTransport {
             raft_client,
             snap_scheduler,
             raft_router,
             resolving: Arc::new(RwLock::new(Default::default())),
+            conns: HashMap::default(),
+            cfg,
             resolver,
         }
     }
 
-    fn send_store(&self, store_id: u64, msg: RaftMessage) {
+    fn send_store(&mut self, store_id: u64, msg: RaftMessage) {
         // Wrapping the fail point in a closure, so we can modify
         // local variables without return,
         let transport_on_send_store_fp = || {
@@ -77,11 +87,24 @@ impl<T: RaftStoreRouter<RocksSnapshot> + 'static, S: StoreAddrResolver + 'static
         };
         transport_on_send_store_fp();
         // check the corresponding token for store.
-        // TODO: avoid clone
-        let addr = self.raft_client.rl().addrs.get(&store_id).cloned();
-        if let Some(addr) = addr {
-            self.write_data(store_id, &addr, msg);
-            return;
+        if msg.get_message().has_snapshot() {
+            // TODO: avoid clone
+            let addr = self.raft_client.rl().addrs.get(&store_id).cloned();
+            if let Some(addr) = addr {
+                return self.send_snapshot_sock(&addr, msg);
+            }
+        } else {
+            if let Some(conn) = self.get_conn(store_id, msg.region_id) {
+                if let Err(SendError(msg)) = conn.stream.send(msg) {
+                    let addr = conn.addr.clone();
+                    drop(conn);
+                    self.conns.remove(&(store_id, msg.region_id));
+                    self.raft_client
+                        .wl()
+                        .remove(store_id, &addr, msg.region_id as usize);
+                }
+                return;
+            }
         }
 
         // No connection, try to resolve it.
@@ -107,7 +130,7 @@ impl<T: RaftStoreRouter<RocksSnapshot> + 'static, S: StoreAddrResolver + 'static
     // Compiler warns `mut addr ` and `mut transport_on_resolve_fp`, when we disable
     // the `failpoints` feature.
     #[allow(unused_mut)]
-    fn resolve(&self, store_id: u64, msg: RaftMessage) {
+    fn resolve(&mut self, store_id: u64, msg: RaftMessage) {
         let trans = self.clone();
         let msg1 = msg.clone();
         let cb = Box::new(move |mut addr: Result<String>| {
@@ -143,10 +166,18 @@ impl<T: RaftStoreRouter<RocksSnapshot> + 'static, S: StoreAddrResolver + 'static
 
             let addr = addr.unwrap();
             info!("resolve store address ok"; "store_id" => store_id, "addr" => %addr);
-            trans.raft_client.wl().addrs.insert(store_id, addr.clone());
-            trans.write_data(store_id, &addr, msg);
-            // There may be no messages in the near future, so flush it immediately.
-            trans.raft_client.wl().flush();
+            // Send message without cache to make sure that the connection is created.
+            {
+                let mut guard = trans.raft_client.wl();
+                guard.addrs.insert(store_id, addr.clone());
+                if msg.get_message().has_snapshot() {
+                    trans.send_snapshot_sock(&addr, msg);
+                } else {
+                    let _ = guard.send(store_id, &addr, msg);
+                }
+                // There may be no messages in the near future, so flush it immediately.
+                guard.flush();
+            }
         });
         if let Err(e) = self.resolver.resolve(store_id, cb) {
             error!("resolve store address failed"; "store_id" => store_id, "err" => ?e);
@@ -156,12 +187,20 @@ impl<T: RaftStoreRouter<RocksSnapshot> + 'static, S: StoreAddrResolver + 'static
         }
     }
 
-    fn write_data(&self, store_id: u64, addr: &str, msg: RaftMessage) {
-        if msg.get_message().has_snapshot() {
-            return self.send_snapshot_sock(addr, msg);
-        }
-        if let Err(e) = self.raft_client.wl().send(store_id, addr, msg) {
-            error!("send raft msg err"; "err" => ?e);
+    fn get_conn(&mut self, store_id: u64, region_id: u64) -> Option<&mut Conn> {
+        let index = region_id % self.cfg.grpc_raft_conn_num as u64;
+        match self.conns.entry((store_id, index)) {
+            HashMapEntry::Occupied(e) => Some(e.into_mut()),
+            HashMapEntry::Vacant(e) => {
+                let mut cli = self.raft_client.wl();
+                let addr = cli.addrs.get(&store_id).cloned();
+                if let Some(addr) = addr {
+                    let conn = cli.get_conn(&addr, region_id, store_id);
+                    Some(e.insert(conn))
+                } else {
+                    None
+                }
+            }
         }
     }
 
@@ -223,10 +262,6 @@ impl<T: RaftStoreRouter<RocksSnapshot> + 'static, S: StoreAddrResolver + 'static
             );
         }
     }
-
-    pub fn flush_raft_client(&mut self) {
-        self.raft_client.wl().flush();
-    }
 }
 
 impl<T, S> Transport for ServerTransport<T, S>
@@ -241,7 +276,17 @@ where
     }
 
     fn flush(&mut self) {
-        self.flush_raft_client();
+        let mut counter = 0;
+        for conn in self.conns.values_mut() {
+            if conn.stream.is_empty() {
+                continue;
+            }
+            if let Some(notifier) = conn.stream.get_notifier() {
+                notifier.notify();
+                counter += 1;
+            }
+        }
+        RAFT_MESSAGE_FLUSH_COUNTER.inc_by(i64::from(counter));
     }
 }
 

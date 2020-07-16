@@ -32,9 +32,10 @@ const RAFT_MSG_NOTIFY_SIZE: usize = 8;
 
 static CONN_ID: AtomicI32 = AtomicI32::new(0);
 
-struct Conn {
-    stream: BatchSender<RaftMessage>,
-    _client: TikvClient,
+#[derive(Clone)]
+pub struct Conn {
+    pub stream: BatchSender<RaftMessage>,
+    pub addr: String,
 }
 
 impl Conn {
@@ -45,7 +46,7 @@ impl Conn {
         cfg: &Config,
         security_mgr: &SecurityManager,
         store_id: u64,
-    ) -> Conn {
+    ) -> (Conn, TikvClient) {
         info!("server: new connection with tikv endpoint"; "addr" => addr);
 
         let cb = ChannelBuilder::new(env)
@@ -127,10 +128,11 @@ impl Conn {
                 .map(|_| ()),
         );
 
-        Conn {
+        let conn = Conn {
             stream: tx,
-            _client: client1,
-        }
+            addr: addr.to_owned(),
+        };
+        (conn, client1)
     }
 }
 
@@ -138,9 +140,9 @@ impl Conn {
 pub struct RaftClient<T: 'static> {
     env: Arc<Environment>,
     router: Mutex<T>,
-    conns: HashMap<(String, usize), Conn>,
+    conns: HashMap<(String, usize), (Conn, TikvClient)>,
     pub addrs: HashMap<u64, String>,
-    cfg: Arc<Config>,
+    pub cfg: Arc<Config>,
     security_mgr: Arc<SecurityManager>,
 
     // To access CPU load of gRPC threads.
@@ -173,12 +175,12 @@ impl<T: RaftStoreRouter<RocksSnapshot>> RaftClient<T> {
         }
     }
 
-    fn get_conn(&mut self, addr: &str, region_id: u64, store_id: u64) -> &mut Conn {
+    pub fn get_conn(&mut self, addr: &str, region_id: u64, store_id: u64) -> Conn {
         let index = region_id as usize % self.cfg.grpc_raft_conn_num;
         match self.conns.entry((addr.to_owned(), index)) {
-            HashMapEntry::Occupied(e) => e.into_mut(),
+            HashMapEntry::Occupied(e) => e.get().0.clone(),
             HashMapEntry::Vacant(e) => {
-                let conn = Conn::new(
+                let (conn, cli) = Conn::new(
                     Arc::clone(&self.env),
                     self.router.lock().unwrap().clone(),
                     addr,
@@ -186,7 +188,20 @@ impl<T: RaftStoreRouter<RocksSnapshot>> RaftClient<T> {
                     &self.security_mgr,
                     store_id,
                 );
-                e.insert(conn)
+                e.insert((conn.clone(), cli));
+                conn
+            }
+        }
+    }
+
+    pub fn remove(&mut self, store_id: u64, addr: &str, region_id: usize) {
+        warn!("send to {} fail, the gRPC connection could be broken", addr);
+        let index = region_id % self.cfg.grpc_raft_conn_num;
+        if let Some(current_addr) = self.addrs.remove(&store_id) {
+            if current_addr != *addr {
+                self.addrs.insert(store_id, current_addr);
+            } else {
+                self.conns.remove(&(addr.to_owned(), index));
             }
         }
     }
@@ -197,15 +212,7 @@ impl<T: RaftStoreRouter<RocksSnapshot>> RaftClient<T> {
             .stream
             .send(msg)
         {
-            warn!("send to {} fail, the gRPC connection could be broken", addr);
-            let index = msg.region_id as usize % self.cfg.grpc_raft_conn_num;
-            self.conns.remove(&(addr.to_owned(), index));
-
-            if let Some(current_addr) = self.addrs.remove(&store_id) {
-                if current_addr != *addr {
-                    self.addrs.insert(store_id, current_addr);
-                }
-            }
+            self.remove(store_id, addr, msg.region_id as usize);
             return Err(box_err!("RaftClient send fail"));
         }
         Ok(())
@@ -213,7 +220,7 @@ impl<T: RaftStoreRouter<RocksSnapshot>> RaftClient<T> {
 
     pub fn flush(&mut self) {
         let (mut counter, mut delay_counter) = (0, 0);
-        for conn in self.conns.values_mut() {
+        for (conn, _) in self.conns.values_mut() {
             if conn.stream.is_empty() {
                 continue;
             }
