@@ -175,10 +175,10 @@ impl<T: RaftStoreRouter<RocksSnapshot>> RaftClient<T> {
         }
     }
 
-    pub fn get_conn(&mut self, addr: &str, region_id: u64, store_id: u64) -> Conn {
+    pub fn get_conn(&mut self, addr: &str, region_id: u64, store_id: u64) -> &mut Conn {
         let index = region_id as usize % self.cfg.grpc_raft_conn_num;
         match self.conns.entry((addr.to_owned(), index)) {
-            HashMapEntry::Occupied(e) => e.get().0.clone(),
+            HashMapEntry::Occupied(e) => &mut e.into_mut().0,
             HashMapEntry::Vacant(e) => {
                 let (conn, cli) = Conn::new(
                     Arc::clone(&self.env),
@@ -188,20 +188,19 @@ impl<T: RaftStoreRouter<RocksSnapshot>> RaftClient<T> {
                     &self.security_mgr,
                     store_id,
                 );
-                e.insert((conn.clone(), cli));
-                conn
+                let ret = e.insert((conn.clone(), cli));
+                &mut ret.0
             }
         }
     }
 
-    pub fn remove(&mut self, store_id: u64, addr: &str, region_id: usize) {
+    pub fn remove(&mut self, store_id: u64, addr: &str, region_id: u64) {
         warn!("send to {} fail, the gRPC connection could be broken", addr);
-        let index = region_id % self.cfg.grpc_raft_conn_num;
+        let index = region_id as usize % self.cfg.grpc_raft_conn_num;
+        self.conns.remove(&(addr.to_owned(), index));
         if let Some(current_addr) = self.addrs.remove(&store_id) {
             if current_addr != *addr {
                 self.addrs.insert(store_id, current_addr);
-            } else {
-                self.conns.remove(&(addr.to_owned(), index));
             }
         }
     }
@@ -212,7 +211,7 @@ impl<T: RaftStoreRouter<RocksSnapshot>> RaftClient<T> {
             .stream
             .send(msg)
         {
-            self.remove(store_id, addr, msg.region_id as usize);
+            self.remove(store_id, addr, msg.region_id);
             return Err(box_err!("RaftClient send fail"));
         }
         Ok(())

@@ -32,6 +32,7 @@ where
     conns: HashMap<(u64, u64), Conn>,
     cfg: Arc<Config>,
     resolver: S,
+    need_flush_raft_client: bool,
 }
 
 impl<T, S> Clone for ServerTransport<T, S>
@@ -49,6 +50,7 @@ where
             // do not clone connection caches
             conns: HashMap::default(),
             cfg: self.cfg.clone(),
+            need_flush_raft_client: self.need_flush_raft_client,
         }
     }
 }
@@ -71,6 +73,7 @@ impl<T: RaftStoreRouter<RocksSnapshot> + 'static, S: StoreAddrResolver + 'static
             conns: HashMap::default(),
             cfg,
             resolver,
+            need_flush_raft_client: false,
         }
     }
 
@@ -94,14 +97,16 @@ impl<T: RaftStoreRouter<RocksSnapshot> + 'static, S: StoreAddrResolver + 'static
                 return self.send_snapshot_sock(&addr, msg);
             }
         } else {
-            if let Some(conn) = self.get_conn(store_id, msg.region_id) {
+            let region_id = msg.region_id;
+            if let Some(conn) = self.get_conn(store_id, region_id) {
                 if let Err(SendError(msg)) = conn.stream.send(msg) {
-                    let addr = conn.addr.clone();
                     drop(conn);
-                    self.conns.remove(&(store_id, msg.region_id));
-                    self.raft_client
-                        .wl()
-                        .remove(store_id, &addr, msg.region_id as usize);
+                    self.conns.remove(&(store_id, region_id));
+                    let mut cli = self.raft_client.wl();
+                    if let Some(addr) = cli.addrs.get(&store_id).cloned() {
+                        let _ = cli.send(store_id, &addr, msg);
+                        self.need_flush_raft_client = true;
+                    }
                 }
                 return;
             }
@@ -173,7 +178,9 @@ impl<T: RaftStoreRouter<RocksSnapshot> + 'static, S: StoreAddrResolver + 'static
                 if msg.get_message().has_snapshot() {
                     trans.send_snapshot_sock(&addr, msg);
                 } else {
-                    let _ = guard.send(store_id, &addr, msg);
+                    if guard.send(store_id, &addr, msg).is_err() {
+                        error!("reconnect failed"; "store_id" => store_id, "address" => addr);
+                    }
                 }
                 // There may be no messages in the near future, so flush it immediately.
                 guard.flush();
@@ -195,7 +202,7 @@ impl<T: RaftStoreRouter<RocksSnapshot> + 'static, S: StoreAddrResolver + 'static
                 let mut cli = self.raft_client.wl();
                 let addr = cli.addrs.get(&store_id).cloned();
                 if let Some(addr) = addr {
-                    let conn = cli.get_conn(&addr, region_id, store_id);
+                    let conn = cli.get_conn(&addr, region_id, store_id).clone();
                     Some(e.insert(conn))
                 } else {
                     None
@@ -285,6 +292,9 @@ where
                 notifier.notify();
                 counter += 1;
             }
+        }
+        if self.need_flush_raft_client {
+            self.raft_client.wl().flush();
         }
         RAFT_MESSAGE_FLUSH_COUNTER.inc_by(i64::from(counter));
     }
