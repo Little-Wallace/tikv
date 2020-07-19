@@ -92,17 +92,18 @@ impl PollHandler<Runner, Runner> for Handler {
         self.local.begin += 1;
     }
 
-    fn handle_control(&mut self, control: &mut Runner) -> Option<usize> {
+    fn handle_control(&mut self, control: &mut Runner) {
         self.local.control += 1;
-        self.handle(control)
+        self.handle(control);
     }
 
-    fn handle_normal(&mut self, normal: &mut Runner) -> Option<usize> {
+    fn handle_normal(&mut self, ctx: &mut BatchContext<Runner, Runner>, mut normal: Box<Runner>) {
         self.local.normal += 1;
-        self.handle(normal)
+        self.handle(&mut normal);
+        ctx.push(normal);
     }
 
-    fn end(&mut self, _normals: &mut [Box<Runner>]) {
+    fn end(&mut self, _normals: &mut BatchContext<Runner, Runner>) {
         let mut c = self.metrics.lock().unwrap();
         *c += self.local;
         self.local = HandleMetrics::default();

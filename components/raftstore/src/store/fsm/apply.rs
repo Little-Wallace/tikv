@@ -14,7 +14,9 @@ use std::sync::Arc;
 use std::time::Duration;
 use std::{cmp, usize};
 
-use batch_system::{BasicMailbox, BatchRouter, BatchSystem, Fsm, HandlerBuilder, PollHandler};
+use batch_system::{
+    BasicMailbox, BatchContext, BatchRouter, BatchSystem, Fsm, HandlerBuilder, PollHandler,
+};
 use crossbeam::channel::{TryRecvError, TrySendError};
 use engine_rocks::{PerfContext, PerfLevel};
 use engine_rocks::{RocksEngine, RocksSnapshot};
@@ -338,6 +340,8 @@ where
     }
 }
 
+type BatchSystemConext<E> = BatchContext<ApplyFsm<E>, ControlFsm>;
+
 struct ApplyContext<E, W>
 where
     E: KvEngine,
@@ -376,6 +380,7 @@ where
     // TxnExtra collected from applied cmds.
     txn_extras: MustConsumeVec<TxnExtra>,
     write_count: usize,
+    channel_timer: Option<Instant>,
 }
 
 impl<E, W> ApplyContext<E, W>
@@ -417,6 +422,7 @@ where
             perf_context_statistics: PerfContextStatistics::new(cfg.perf_level),
             yield_duration: cfg.apply_yield_duration.0,
             txn_extras: MustConsumeVec::new("extra data from txn"),
+            channel_timer: None,
         }
     }
 
@@ -459,23 +465,25 @@ where
     /// write the changes into rocksdb.
     ///
     /// This call is valid only when it's between a `prepare_for` and `finish_for`.
-    pub fn commit(&mut self, delegate: &mut ApplyDelegate<E>) {
+    pub fn commit(&mut self, delegate: &mut ApplyDelegate<E>) -> bool {
         if self.last_applied_index < delegate.apply_state.get_applied_index() {
             delegate.write_apply_state(self.kv_wb.as_mut().unwrap());
         }
         // last_applied_index doesn't need to be updated, set persistent to true will
         // force it call `prepare_for` automatically.
-        self.commit_opt(delegate, true);
+        self.commit_opt(delegate, true)
     }
 
-    fn commit_opt(&mut self, delegate: &mut ApplyDelegate<E>, persistent: bool) {
+    fn commit_opt(&mut self, delegate: &mut ApplyDelegate<E>, persistent: bool) -> bool {
         delegate.update_metrics(self);
+        let mut sync = false;
         if persistent {
-            self.write_to_db();
+            sync = self.flush();
             self.prepare_for(delegate);
         }
         self.kv_wb_last_bytes = self.kv_wb().data_size() as u64;
         self.kv_wb_last_keys = self.kv_wb().count() as u64;
+        sync
     }
 
     /// Writes all the changes into RocksDB.
@@ -559,19 +567,7 @@ where
     /// Flush all pending writes to engines.
     /// If it returns true, all pending writes are persisted in engines.
     pub fn flush(&mut self) -> bool {
-        // TODO: this check is too hacky, need to be more verbose and less buggy.
-        let t = match self.timer.take() {
-            Some(t) => t,
-            None => return false,
-        };
-
-        // Write to engine
-        // raftstore.sync-log = true means we need prevent data loss when power failure.
-        // take raft log gc for example, we write kv WAL first, then write raft WAL,
-        // if power failure happen, raft WAL may synced to disk, but kv WAL may not.
-        // so we use sync-log flag here.
-        let is_synced = self.write_to_db();
-
+        let sync = self.write_to_db();
         if !self.apply_res.is_empty() {
             for res in self.apply_res.drain(..) {
                 self.notifier.notify(
@@ -582,18 +578,7 @@ where
                 );
             }
         }
-
-        let elapsed = t.elapsed();
-        STORE_APPLY_LOG_HISTOGRAM.observe(duration_to_sec(elapsed) as f64);
-
-        slow_log!(
-            elapsed,
-            "{} handle ready {} committed entries",
-            self.tag,
-            self.committed_count
-        );
-        self.committed_count = 0;
-        is_synced
+        sync
     }
 }
 
@@ -841,6 +826,7 @@ where
     fn handle_raft_committed_entries<W: WriteBatch + WriteBatchVecExt<E>>(
         &mut self,
         apply_ctx: &mut ApplyContext<E, W>,
+        ctx: &mut BatchSystemConext<E>,
         mut committed_entries_drainer: Drain<Entry>,
     ) {
         if committed_entries_drainer.len() == 0 {
@@ -869,7 +855,7 @@ where
             }
 
             let res = match entry.get_entry_type() {
-                EntryType::EntryNormal => self.handle_raft_entry_normal(apply_ctx, &entry),
+                EntryType::EntryNormal => self.handle_raft_entry_normal(apply_ctx, ctx, &entry),
                 EntryType::EntryConfChange => self.handle_raft_entry_conf_change(apply_ctx, &entry),
                 EntryType::EntryConfChangeV2 => unimplemented!(),
             };
@@ -930,6 +916,7 @@ where
     fn handle_raft_entry_normal<W: WriteBatch + WriteBatchVecExt<E>>(
         &mut self,
         apply_ctx: &mut ApplyContext<E, W>,
+        ctx: &mut BatchContext<ApplyFsm<E>, ControlFsm>,
         entry: &Entry,
     ) -> ApplyResult<E::Snapshot> {
         fail_point!("yield_apply_1000", self.region_id() == 1000, |_| {
@@ -944,7 +931,13 @@ where
             let cmd = util::parse_data_at(data, index, &self.tag);
 
             if should_write_to_engine(&cmd) || apply_ctx.kv_wb().should_write_to_engine() {
-                apply_ctx.commit(self);
+                if apply_ctx.commit(self) {
+                    for fsm in ctx.get_mut() {
+                        fsm.delegate.last_sync_apply_index =
+                            fsm.delegate.apply_state.get_applied_index();
+                    }
+                }
+                ctx.release(true);
                 if let Some(start) = self.handle_start.as_ref() {
                     if start.elapsed() >= apply_ctx.yield_duration {
                         return ApplyResult::Yield;
@@ -2632,6 +2625,7 @@ where
     delegate: ApplyDelegate<E>,
     receiver: Receiver<Msg<E>>,
     mailbox: Option<BasicMailbox<ApplyFsm<E>>>,
+    expected_msg_count: Option<usize>,
 }
 
 impl<E> ApplyFsm<E>
@@ -2652,6 +2646,7 @@ where
                 delegate,
                 receiver: rx,
                 mailbox: None,
+                expected_msg_count: None,
             }),
         )
     }
@@ -2674,6 +2669,7 @@ where
     fn handle_apply<W: WriteBatch + WriteBatchVecExt<E>>(
         &mut self,
         apply_ctx: &mut ApplyContext<E, W>,
+        ctx: &mut BatchContext<ApplyFsm<E>, ControlFsm>,
         mut apply: Apply<E::Snapshot>,
     ) {
         if apply_ctx.timer.is_none() {
@@ -2714,7 +2710,7 @@ where
 
         self.append_proposal(apply.cbs.drain(..));
         self.delegate
-            .handle_raft_committed_entries(apply_ctx, apply.entries.drain(..));
+            .handle_raft_committed_entries(apply_ctx, ctx, apply.entries.drain(..));
         fail_point!("post_handle_apply_1003", self.delegate.id() == 1003, |_| {});
         if self.delegate.yield_state.is_some() {
             return;
@@ -2800,6 +2796,7 @@ where
     fn resume_pending<W: WriteBatch + WriteBatchVecExt<E>>(
         &mut self,
         ctx: &mut ApplyContext<E, W>,
+        batch_ctx: &mut BatchContext<ApplyFsm<E>, ControlFsm>,
     ) {
         if let Some(ref state) = self.delegate.wait_merge_state {
             let source_region_id = state.logs_up_to_date.load(Ordering::SeqCst);
@@ -2816,8 +2813,11 @@ where
             ctx.timer = Some(Instant::now_coarse());
         }
         if !state.pending_entries.is_empty() {
-            self.delegate
-                .handle_raft_committed_entries(ctx, state.pending_entries.drain(..));
+            self.delegate.handle_raft_committed_entries(
+                ctx,
+                batch_ctx,
+                state.pending_entries.drain(..),
+            );
             if let Some(ref mut s) = self.delegate.yield_state {
                 // So the delegate is expected to yield the CPU.
                 // It can either be executing another `CommitMerge` in pending_msgs
@@ -2828,7 +2828,7 @@ where
         }
 
         if !state.pending_msgs.is_empty() {
-            self.handle_tasks(ctx, &mut state.pending_msgs);
+            self.handle_tasks(ctx, batch_ctx, &mut state.pending_msgs);
         }
     }
 
@@ -3005,43 +3005,52 @@ where
         cb.invoke_read(resp);
     }
 
+    fn handle_task<W: WriteBatch + WriteBatchVecExt<E>>(
+        &mut self,
+        apply_ctx: &mut ApplyContext<E, W>,
+        ctx: &mut BatchContext<ApplyFsm<E>, ControlFsm>,
+        msg: Msg<E>,
+    ) {
+        match msg {
+            Msg::Apply { start, apply } => {
+                if apply_ctx.channel_timer.is_none() {
+                    apply_ctx.channel_timer = Some(start);
+                }
+                self.handle_apply(apply_ctx, ctx, apply);
+            }
+            Msg::Registration(reg) => self.handle_registration(reg),
+            Msg::Destroy(d) => self.handle_destroy(apply_ctx, d),
+            Msg::LogsUpToDate(cul) => self.logs_up_to_date_for_merge(apply_ctx, cul),
+            Msg::Noop => {}
+            Msg::Snapshot(snap_task) => self.handle_snapshot(apply_ctx, snap_task),
+            Msg::Change {
+                cmd,
+                region_epoch,
+                cb,
+            } => self.handle_change(apply_ctx, cmd, region_epoch, cb),
+            #[cfg(any(test, feature = "testexport"))]
+            Msg::Validate(_, f) => f((&self.delegate, apply_ctx.enable_sync_log)),
+        }
+    }
+
     fn handle_tasks<W: WriteBatch + WriteBatchVecExt<E>>(
         &mut self,
         apply_ctx: &mut ApplyContext<E, W>,
+        ctx: &mut BatchSystemConext<E>,
         msgs: &mut Vec<Msg<E>>,
     ) {
-        let mut channel_timer = None;
         let mut drainer = msgs.drain(..);
         loop {
             match drainer.next() {
-                Some(Msg::Apply { start, apply }) => {
-                    if channel_timer.is_none() {
-                        channel_timer = Some(start);
-                    }
-                    self.handle_apply(apply_ctx, apply);
+                Some(msg) => {
+                    self.handle_task(apply_ctx, ctx, msg);
                     if let Some(ref mut state) = self.delegate.yield_state {
                         state.pending_msgs = drainer.collect();
                         break;
                     }
                 }
-                Some(Msg::Registration(reg)) => self.handle_registration(reg),
-                Some(Msg::Destroy(d)) => self.handle_destroy(apply_ctx, d),
-                Some(Msg::LogsUpToDate(cul)) => self.logs_up_to_date_for_merge(apply_ctx, cul),
-                Some(Msg::Noop) => {}
-                Some(Msg::Snapshot(snap_task)) => self.handle_snapshot(apply_ctx, snap_task),
-                Some(Msg::Change {
-                    cmd,
-                    region_epoch,
-                    cb,
-                }) => self.handle_change(apply_ctx, cmd, region_epoch, cb),
-                #[cfg(any(test, feature = "testexport"))]
-                Some(Msg::Validate(_, f)) => f((&self.delegate, apply_ctx.enable_sync_log)),
                 None => break,
             }
-        }
-        if let Some(timer) = channel_timer {
-            let elapsed = duration_to_sec(timer.elapsed());
-            APPLY_TASK_WAIT_TIME_HISTOGRAM.observe(elapsed);
         }
     }
 }
@@ -3055,6 +3064,10 @@ where
     #[inline]
     fn is_stopped(&self) -> bool {
         self.delegate.stopped
+    }
+
+    fn check_len(&self) -> Option<usize> {
+        self.expected_msg_count
     }
 
     #[inline]
@@ -3132,72 +3145,102 @@ where
     }
 
     /// There is no control fsm in apply poller.
-    fn handle_control(&mut self, _: &mut ControlFsm) -> Option<usize> {
+    fn handle_control(&mut self, _: &mut ControlFsm) {
         unimplemented!()
     }
 
-    fn handle_normal(&mut self, normal: &mut ApplyFsm<E>) -> Option<usize> {
-        let mut expected_msg_count = None;
+    fn handle_normal(&mut self, ctx: &mut BatchSystemConext<E>, mut normal: Box<ApplyFsm<E>>) {
+        normal.expected_msg_count = None;
         normal.delegate.handle_start = Some(Instant::now_coarse());
         if normal.delegate.yield_state.is_some() {
             if normal.delegate.wait_merge_state.is_some() {
                 // We need to query the length first, otherwise there is a race
                 // condition that new messages are queued after resuming and before
                 // query the length.
-                expected_msg_count = Some(normal.receiver.len());
+                normal.expected_msg_count = Some(normal.receiver.len());
             }
-            normal.resume_pending(&mut self.apply_ctx);
+            normal.resume_pending(&mut self.apply_ctx, ctx);
             if normal.delegate.wait_merge_state.is_some() {
                 // Yield due to applying CommitMerge, this fsm can be released if its
                 // channel msg count equals to expected_msg_count because it will receive
                 // a new message if its source region has applied all needed logs.
-                return expected_msg_count;
+                return;
             } else if normal.delegate.yield_state.is_some() {
                 // Yield due to other reasons, this fsm must not be released because
                 // it's possible that no new message will be sent to itself.
                 // The remaining messages will be handled in next rounds.
-                return None;
+                normal.expected_msg_count = None;
+                return;
             }
-            expected_msg_count = None;
+            normal.expected_msg_count = None;
         }
-        while self.msg_buf.len() < self.messages_per_tick {
-            match normal.receiver.try_recv() {
-                Ok(msg) => self.msg_buf.push(msg),
+        let mut count = 0;
+        while count < self.messages_per_tick {
+            let msg = match normal.receiver.try_recv() {
+                Ok(msg) => msg,
                 Err(TryRecvError::Empty) => {
-                    expected_msg_count = Some(0);
+                    normal.expected_msg_count = Some(0);
                     break;
                 }
                 Err(TryRecvError::Disconnected) => {
                     normal.delegate.stopped = true;
-                    expected_msg_count = Some(0);
+                    normal.expected_msg_count = Some(0);
                     break;
                 }
-            }
+            };
+            normal.handle_task(&mut self.apply_ctx, ctx, msg);
+            count += 1;
         }
-        normal.handle_tasks(&mut self.apply_ctx, &mut self.msg_buf);
+        if let Some(timer) = self.apply_ctx.channel_timer.take() {
+            let elapsed = duration_to_sec(timer.elapsed());
+            APPLY_TASK_WAIT_TIME_HISTOGRAM.observe(elapsed);
+        }
+
         if normal.delegate.wait_merge_state.is_some() {
             // Check it again immediately as catching up logs can be very fast.
-            expected_msg_count = Some(0);
+            normal.expected_msg_count = Some(0);
         } else if normal.delegate.yield_state.is_some() {
             // Let it continue to run next time.
-            expected_msg_count = None;
+            normal.expected_msg_count = None;
         }
-        expected_msg_count
+        ctx.push(normal);
     }
 
-    fn end(&mut self, fsms: &mut [Box<ApplyFsm<E>>]) {
-        let is_synced = self.apply_ctx.flush();
-        FSM_BATCH_SIZE_HISTOGRAM
-            .with_label_values(&["apply_write_times"])
-            .observe(self.apply_ctx.write_count as f64);
-        FSM_BATCH_SIZE_HISTOGRAM
-            .with_label_values(&["apply_batch_count"])
-            .observe(fsms.len() as f64);
-        if is_synced {
+    fn end(&mut self, ctx: &mut BatchSystemConext<E>) {
+        // TODO: this check is too hacky, need to be more verbose and less buggy.
+        let t = match self.apply_ctx.timer.take() {
+            Some(t) => t,
+            None => return,
+        };
+
+        // Write to engine
+        // raftstore.sync-log = true means we need prevent data loss when power failure.
+        // take raft log gc for example, we write kv WAL first, then write raft WAL,
+        // if power failure happen, raft WAL may synced to disk, but kv WAL may not.
+        // so we use sync-log flag here.
+        if self.apply_ctx.flush() {
+            let fsms = ctx.get_mut();
+            FSM_BATCH_SIZE_HISTOGRAM
+                .with_label_values(&["apply_batch_count"])
+                .observe(fsms.len() as f64);
             for fsm in fsms {
                 fsm.delegate.last_sync_apply_index = fsm.delegate.apply_state.get_applied_index();
             }
         }
+
+        let elapsed = t.elapsed();
+        STORE_APPLY_LOG_HISTOGRAM.observe(duration_to_sec(elapsed) as f64);
+
+        slow_log!(
+            elapsed,
+            "{} handle ready {} committed entries",
+            self.apply_ctx.tag,
+            self.apply_ctx.committed_count
+        );
+        self.apply_ctx.committed_count = 0;
+        FSM_BATCH_SIZE_HISTOGRAM
+            .with_label_values(&["apply_write_times"])
+            .observe(self.apply_ctx.write_count as f64);
     }
 }
 

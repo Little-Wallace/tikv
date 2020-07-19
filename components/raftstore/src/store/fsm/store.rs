@@ -1,6 +1,8 @@
 // Copyright 2016 TiKV Project Authors. Licensed under Apache-2.0.
 
-use batch_system::{BasicMailbox, BatchRouter, BatchSystem, Fsm, HandlerBuilder, PollHandler};
+use batch_system::{
+    BasicMailbox, BatchContext, BatchRouter, BatchSystem, Fsm, HandlerBuilder, PollHandler,
+};
 use crossbeam::channel::{TryRecvError, TrySendError};
 use engine_rocks::{PerfContext, PerfLevel};
 use engine_rocks::{
@@ -407,6 +409,7 @@ struct Store {
 pub struct StoreFsm {
     store: Store,
     receiver: Receiver<StoreMsg>,
+    expected_msg_count: Option<usize>,
 }
 
 impl StoreFsm {
@@ -422,6 +425,7 @@ impl StoreFsm {
                 last_unreachable_report: HashMap::default(),
             },
             receiver: rx,
+            expected_msg_count: None,
         });
         (tx, fsm)
     }
@@ -433,6 +437,10 @@ impl Fsm for StoreFsm {
     #[inline]
     fn is_stopped(&self) -> bool {
         self.store.stopped
+    }
+
+    fn check_len(&self) -> Option<usize> {
+        self.expected_msg_count
     }
 }
 
@@ -645,6 +653,8 @@ impl<T: Transport, C: PdClient> RaftPoller<T, C> {
     }
 }
 
+type BatchSystemConext = BatchContext<PeerFsm<RocksSnapshot>, StoreFsm>;
+
 impl<T: Transport, C: PdClient> PollHandler<PeerFsm<RocksSnapshot>, StoreFsm> for RaftPoller<T, C> {
     fn begin(&mut self, _batch_size: usize) {
         self.previous_metrics = self.poll_ctx.raft_metrics.clone();
@@ -675,18 +685,18 @@ impl<T: Transport, C: PdClient> PollHandler<PeerFsm<RocksSnapshot>, StoreFsm> fo
         }
     }
 
-    fn handle_control(&mut self, store: &mut StoreFsm) -> Option<usize> {
-        let mut expected_msg_count = None;
+    fn handle_control(&mut self, store: &mut StoreFsm) {
+        store.expected_msg_count = None;
         while self.store_msg_buf.len() < self.messages_per_tick {
             match store.receiver.try_recv() {
                 Ok(msg) => self.store_msg_buf.push(msg),
                 Err(TryRecvError::Empty) => {
-                    expected_msg_count = Some(0);
+                    store.expected_msg_count = Some(0);
                     break;
                 }
                 Err(TryRecvError::Disconnected) => {
                     store.store.stopped = true;
-                    expected_msg_count = Some(0);
+                    store.expected_msg_count = Some(0);
                     break;
                 }
             }
@@ -696,12 +706,14 @@ impl<T: Transport, C: PdClient> PollHandler<PeerFsm<RocksSnapshot>, StoreFsm> fo
             ctx: &mut self.poll_ctx,
         };
         delegate.handle_msgs(&mut self.store_msg_buf);
-        expected_msg_count
     }
 
-    fn handle_normal(&mut self, peer: &mut PeerFsm<RocksSnapshot>) -> Option<usize> {
-        let mut expected_msg_count = None;
-
+    fn handle_normal(
+        &mut self,
+        ctx: &mut BatchSystemConext,
+        mut peer: Box<PeerFsm<RocksSnapshot>>,
+    ) {
+        peer.expected_msg_count = None;
         fail_point!(
             "pause_on_peer_collect_message",
             peer.peer_id() == 1,
@@ -726,29 +738,36 @@ impl<T: Transport, C: PdClient> PollHandler<PeerFsm<RocksSnapshot>, StoreFsm> fo
                     self.peer_msg_buf.push(msg);
                 }
                 Err(TryRecvError::Empty) => {
-                    expected_msg_count = Some(0);
+                    peer.expected_msg_count = Some(0);
                     break;
                 }
                 Err(TryRecvError::Disconnected) => {
                     peer.stop();
-                    expected_msg_count = Some(0);
+                    peer.expected_msg_count = Some(0);
                     break;
                 }
             }
         }
-        let mut delegate = PeerFsmDelegate::new(peer, &mut self.poll_ctx);
+        let mut delegate = PeerFsmDelegate::new(&mut peer, &mut self.poll_ctx);
         delegate.handle_msgs(&mut self.peer_msg_buf);
-        delegate.collect_ready();
-        expected_msg_count
+        if delegate.collect_ready() {
+            ctx.push(peer);
+        } else {
+            ctx.release_normal(peer, true);
+        }
     }
 
-    fn end(&mut self, peers: &mut [Box<PeerFsm<RocksSnapshot>>]) {
-        FSM_BATCH_SIZE_HISTOGRAM
-            .with_label_values(&["raft_write_count"])
-            .observe(self.poll_ctx.kv_wb.count() as f64);
+    fn end(&mut self, ctx: &mut BatchSystemConext) {
+        let peers = ctx.get_mut();
         FSM_BATCH_SIZE_HISTOGRAM
             .with_label_values(&["raft_batch_count"])
             .observe(peers.len() as f64);
+        FSM_BATCH_SIZE_HISTOGRAM
+            .with_label_values(&["raft_write_count"])
+            .observe(self.poll_ctx.raft_wb.count() as f64);
+        FSM_BATCH_SIZE_HISTOGRAM
+            .with_label_values(&["raft_ready_count"])
+            .observe((peers.len() - self.poll_ctx.pending_count) as f64);
         if self.poll_ctx.has_ready {
             self.handle_raft_ready(peers);
         }

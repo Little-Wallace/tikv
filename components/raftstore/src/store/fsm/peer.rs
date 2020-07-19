@@ -98,7 +98,7 @@ pub struct PeerFsm<S: Snapshot> {
     missing_ticks: usize,
     group_state: GroupState,
     stopped: bool,
-    has_ready: bool,
+    pub has_ready: bool,
     early_apply: bool,
     mailbox: Option<BasicMailbox<PeerFsm<S>>>,
     pub receiver: Receiver<PeerMsg<S>>,
@@ -107,6 +107,7 @@ pub struct PeerFsm<S: Snapshot> {
 
     // Batch raft command which has the same header into an entry
     batch_req_builder: BatchRaftCmdRequestBuilder,
+    pub expected_msg_count: Option<usize>,
 }
 
 pub struct BatchRaftCmdRequestBuilder {
@@ -183,6 +184,7 @@ impl<S: Snapshot> PeerFsm<S> {
                 batch_req_builder: BatchRaftCmdRequestBuilder::new(
                     cfg.raft_entry_max_size.0 as f64,
                 ),
+                expected_msg_count: None,
             }),
         ))
     }
@@ -225,6 +227,7 @@ impl<S: Snapshot> PeerFsm<S> {
                 batch_req_builder: BatchRaftCmdRequestBuilder::new(
                     cfg.raft_entry_max_size.0 as f64,
                 ),
+                expected_msg_count: None,
             }),
         ))
     }
@@ -373,6 +376,10 @@ impl<S: Snapshot> Fsm for PeerFsm<S> {
     #[inline]
     fn is_stopped(&self) -> bool {
         self.stopped
+    }
+
+    fn check_len(&self) -> Option<usize> {
+        self.expected_msg_count
     }
 
     /// Set a mailbox to Fsm, which should be used to send message to itself.
@@ -804,15 +811,16 @@ impl<'a, T: Transport, C: PdClient> PeerFsmDelegate<'a, T, C> {
         }
     }
 
-    pub fn collect_ready(&mut self) {
+    pub fn collect_ready(&mut self) -> bool {
         let has_ready = self.fsm.has_ready;
         self.fsm.has_ready = false;
         if !has_ready || self.fsm.stopped {
-            return;
+            return false;
         }
         self.ctx.pending_count += 1;
         self.ctx.has_ready = true;
         let res = self.fsm.peer.handle_raft_ready_append(self.ctx);
+        let has_ready = res.is_some();
         if let Some(r) = res {
             self.on_role_changed(&r.0);
             if !r.0.entries().is_empty() {
@@ -821,6 +829,7 @@ impl<'a, T: Transport, C: PdClient> PeerFsmDelegate<'a, T, C> {
             }
             self.ctx.ready_res.push(r);
         }
+        has_ready
     }
 
     #[inline]

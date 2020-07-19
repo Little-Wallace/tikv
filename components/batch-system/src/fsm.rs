@@ -36,6 +36,15 @@ pub trait Fsm {
         Self: Sized,
     {
     }
+
+    fn check_len(&self) -> Option<usize> {
+        None
+    }
+
+    fn schedule_time(&self) -> std::time::Duration {
+        std::time::Duration::from_millis(0)
+    }
+
     /// Take the mailbox from Fsm. Implementation should ensure there will be
     /// no reference to mailbox after calling this method.
     fn take_mailbox(&mut self) -> Option<BasicMailbox<Self>>
