@@ -193,6 +193,14 @@ impl<C: RaftStoreRouter<RocksEngine>> RaftStoreRouter<RocksEngine> for SimulateT
         filter_send(&self.filters, msg, |m| self.ch.send_raft_msg(m))
     }
 
+    fn send_raw_command(
+        &self,
+        header: RaftRequestHeader,
+        data: Vec<u8>,
+        cb: Callback<RocksSnapshot>,
+    ) -> Result<()> {
+        self.ch.send_raw_command(header, data, cb)
+    }
     fn send_command(&self, req: RaftCmdRequest, cb: Callback<RocksSnapshot>) -> Result<()> {
         self.ch.send_command(req, cb)
     }

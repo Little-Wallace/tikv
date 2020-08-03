@@ -1,12 +1,13 @@
 // Copyright 2019 TiKV Project Authors. Licensed under Apache-2.0.
 
 use crossbeam::{SendError, TrySendError};
-use kvproto::raft_cmdpb::RaftCmdRequest;
+use kvproto::raft_cmdpb::{RaftCmdRequest, RaftRequestHeader};
 use kvproto::raft_serverpb::RaftMessage;
 
 use crate::store::fsm::RaftRouter;
 use crate::store::{
-    Callback, CasualMessage, LocalReader, PeerMsg, RaftCommand, SignificantMsg, StoreMsg,
+    Callback, CasualMessage, LocalReader, PeerMsg, RaftCommand, RaftRawCommand, SignificantMsg,
+    StoreMsg,
 };
 use crate::{DiscardReason, Error as RaftStoreError, Result as RaftStoreResult};
 use engine_rocks::RocksEngine;
@@ -23,6 +24,13 @@ where
 {
     /// Sends RaftMessage to local store.
     fn send_raft_msg(&self, msg: RaftMessage) -> RaftStoreResult<()>;
+
+    fn send_raw_command(
+        &self,
+        header: RaftRequestHeader,
+        data: Vec<u8>,
+        cb: Callback<EK::Snapshot>,
+    ) -> RaftStoreResult<()>;
 
     /// Sends RaftCmdRequest to local store.
     fn send_command(&self, req: RaftCmdRequest, cb: Callback<EK::Snapshot>) -> RaftStoreResult<()> {
@@ -98,6 +106,15 @@ where
 {
     /// Sends RaftMessage to local store.
     fn send_raft_msg(&self, _: RaftMessage) -> RaftStoreResult<()> {
+        Ok(())
+    }
+
+    fn send_raw_command(
+        &self,
+        _: RaftRequestHeader,
+        _: Vec<u8>,
+        _: Callback<EK::Snapshot>,
+    ) -> RaftStoreResult<()> {
         Ok(())
     }
 
@@ -186,6 +203,19 @@ where
         let region_id = msg.get_region_id();
         self.router
             .send_raft_message(msg)
+            .map_err(|e| handle_send_error(region_id, e))
+    }
+
+    fn send_raw_command(
+        &self,
+        header: RaftRequestHeader,
+        data: Vec<u8>,
+        cb: Callback<EK::Snapshot>,
+    ) -> RaftStoreResult<()> {
+        let region_id = header.get_region_id();
+        let msg = RaftRawCommand::new(header, data, cb);
+        self.router
+            .send(region_id, PeerMsg::RaftRawCommand(msg))
             .map_err(|e| handle_send_error(region_id, e))
     }
 

@@ -1,8 +1,8 @@
 // Copyright 2016 TiKV Project Authors. Licensed under Apache-2.0.
 
-use engine_rocks::{RocksEngine, RocksSnapshot, RocksTablePropertiesCollection};
-use engine_traits::CfName;
+use engine_rocks::{RocksEngine, RocksSnapshot, RocksTablePropertiesCollection, RocksWriteBatch};
 use engine_traits::CF_DEFAULT;
+use engine_traits::{CfName, Mutable, WriteBatch, WriteBatchExt};
 use engine_traits::{IterOptions, Peekable, ReadOptions, Snapshot, TablePropertiesExt};
 use kvproto::kvrpcpb::Context;
 use kvproto::raft_cmdpb::{
@@ -10,6 +10,7 @@ use kvproto::raft_cmdpb::{
     RaftRequestHeader, Request, Response,
 };
 use kvproto::{errorpb, metapb};
+use std::cell::RefCell;
 use std::fmt::{self, Debug, Display, Formatter};
 use std::io::Error as IoError;
 use std::result;
@@ -104,10 +105,20 @@ impl From<RaftServerError> for KvError {
 }
 
 /// `RaftKv` is a storage engine base on `RaftStore`.
-#[derive(Clone)]
 pub struct RaftKv<S: RaftStoreRouter<RocksEngine> + 'static> {
     router: S,
     engine: RocksEngine,
+    wb: RefCell<RocksWriteBatch>,
+}
+
+impl<S: RaftStoreRouter<RocksEngine> + 'static> Clone for RaftKv<S> {
+    fn clone(&self) -> Self {
+        RaftKv {
+            router: self.router.clone(),
+            engine: self.engine.clone(),
+            wb: RefCell::new(self.engine.write_batch()),
+        }
+    }
 }
 
 pub enum CmdRes {
@@ -165,7 +176,8 @@ fn on_read_result(
 impl<S: RaftStoreRouter<RocksEngine>> RaftKv<S> {
     /// Create a RaftKv using specified configuration.
     pub fn new(router: S, engine: RocksEngine) -> RaftKv<S> {
-        RaftKv { router, engine }
+        let wb = RefCell::new(engine.write_batch());
+        RaftKv { router, engine, wb }
     }
 
     fn new_request_header(&self, ctx: &Context) -> RaftRequestHeader {
@@ -179,6 +191,14 @@ impl<S: RaftStoreRouter<RocksEngine>> RaftKv<S> {
         header.set_sync_log(ctx.get_sync_log());
         header.set_replica_read(ctx.get_replica_read());
         header
+    }
+    fn has_delete_range(&self, modifies: &[Modify]) -> bool {
+        for m in modifies {
+            if let Modify::DeleteRange(..) = m {
+                return true;
+            }
+        }
+        false
     }
 
     fn exec_snapshot(
@@ -198,6 +218,44 @@ impl<S: RaftStoreRouter<RocksEngine>> RaftKv<S> {
                 cmd,
                 StoreCallback::Read(Box::new(move |resp| {
                     let (cb_ctx, res) = on_read_result(resp, 1);
+                    cb((cb_ctx, res.map_err(Error::into)));
+                })),
+            )
+            .map_err(From::from)
+    }
+
+    fn exec_raw_write(
+        &self,
+        ctx: &Context,
+        modifies: Vec<Modify>,
+        cb: Callback<CmdRes>,
+    ) -> Result<()> {
+        let header = self.new_request_header(ctx);
+        let mut wb = self.wb.borrow_mut();
+        for m in modifies {
+            match m {
+                Modify::Delete(cf, k) => {
+                    let key = keys::data_key(k.as_encoded());
+                    wb.delete_cf(cf, &key).unwrap();
+                }
+                Modify::Put(cf, k, v) => {
+                    let key = keys::data_key(k.as_encoded());
+                    wb.put_cf(cf, &key, &v).unwrap();
+                }
+                Modify::DeleteRange(..) => panic!(),
+            }
+        }
+
+        ASYNC_REQUESTS_COUNTER_VEC.write.all.inc();
+        let data = wb.data().to_vec();
+        wb.clear();
+
+        self.router
+            .send_raw_command(
+                header,
+                data,
+                StoreCallback::Write(Box::new(move |resp| {
+                    let (cb_ctx, res) = on_write_result(resp, 0);
                     cb((cb_ctx, res.map_err(Error::into)));
                 })),
             )
@@ -232,7 +290,6 @@ impl<S: RaftStoreRouter<RocksEngine>> RaftKv<S> {
             };
             raftkv_early_error_report_fp()?;
         }
-
         let len = reqs.len();
         let header = self.new_request_header(ctx);
         let mut cmd = RaftCmdRequest::default();
@@ -317,7 +374,36 @@ impl<S: RaftStoreRouter<RocksEngine>> Engine for RaftKv<S> {
         if batch.modifies.is_empty() {
             return Err(KvError::from(KvErrorInner::EmptyRequest));
         }
-
+        let begin_instant = Instant::now_coarse();
+        ASYNC_REQUESTS_COUNTER_VEC.write.all.inc();
+        let write_cb = Box::new(move |(cb_ctx, res)| match res {
+            Ok(CmdRes::Resp(_)) => {
+                ASYNC_REQUESTS_COUNTER_VEC.write.success.inc();
+                ASYNC_REQUESTS_DURATIONS_VEC
+                    .write
+                    .observe(begin_instant.elapsed_secs());
+                fail_point!("raftkv_async_write_finish");
+                cb((cb_ctx, Ok(())))
+            }
+            Ok(CmdRes::Snap(_)) => cb((
+                cb_ctx,
+                Err(box_err!("unexpect snapshot, should mutate instead.")),
+            )),
+            Err(e) => {
+                let status_kind = get_status_kind_from_engine_error(&e);
+                ASYNC_REQUESTS_COUNTER_VEC.write.get(status_kind).inc();
+                cb((cb_ctx, Err(e)))
+            }
+        });
+        if batch.extra.is_empty() && !self.has_delete_range(&batch.modifies) {
+            return self
+                .exec_raw_write(ctx, batch.modifies, write_cb)
+                .map_err(|e| {
+                    let status_kind = get_status_kind_from_error(&e);
+                    ASYNC_REQUESTS_COUNTER_VEC.write.get(status_kind).inc();
+                    e.into()
+                });
+        }
         let mut reqs = Vec::with_capacity(batch.modifies.len());
         for m in batch.modifies {
             let mut req = Request::default();
@@ -354,38 +440,12 @@ impl<S: RaftStoreRouter<RocksEngine>> Engine for RaftKv<S> {
             reqs.push(req);
         }
 
-        ASYNC_REQUESTS_COUNTER_VEC.write.all.inc();
-        let begin_instant = Instant::now_coarse();
-
-        self.exec_write_requests(
-            ctx,
-            reqs,
-            batch.extra,
-            Box::new(move |(cb_ctx, res)| match res {
-                Ok(CmdRes::Resp(_)) => {
-                    ASYNC_REQUESTS_COUNTER_VEC.write.success.inc();
-                    ASYNC_REQUESTS_DURATIONS_VEC
-                        .write
-                        .observe(begin_instant.elapsed_secs());
-                    fail_point!("raftkv_async_write_finish");
-                    cb((cb_ctx, Ok(())))
-                }
-                Ok(CmdRes::Snap(_)) => cb((
-                    cb_ctx,
-                    Err(box_err!("unexpect snapshot, should mutate instead.")),
-                )),
-                Err(e) => {
-                    let status_kind = get_status_kind_from_engine_error(&e);
-                    ASYNC_REQUESTS_COUNTER_VEC.write.get(status_kind).inc();
-                    cb((cb_ctx, Err(e)))
-                }
-            }),
-        )
-        .map_err(|e| {
-            let status_kind = get_status_kind_from_error(&e);
-            ASYNC_REQUESTS_COUNTER_VEC.write.get(status_kind).inc();
-            e.into()
-        })
+        self.exec_write_requests(ctx, reqs, batch.extra, write_cb)
+            .map_err(|e| {
+                let status_kind = get_status_kind_from_error(&e);
+                ASYNC_REQUESTS_COUNTER_VEC.write.get(status_kind).inc();
+                e.into()
+            })
     }
 
     fn async_snapshot(

@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use std::{cmp, u64};
 
 use batch_system::{BasicMailbox, Fsm};
-use engine_rocks::RocksEngine;
+use engine_rocks::{RawWriteBatch, RocksEngine};
 use engine_traits::CF_RAFT;
 use engine_traits::{KvEngine, KvEngines, Snapshot, WriteBatchExt};
 use futures::Future;
@@ -16,8 +16,8 @@ use kvproto::import_sstpb::SstMeta;
 use kvproto::metapb::{self, Region, RegionEpoch};
 use kvproto::pdpb::CheckPolicy;
 use kvproto::raft_cmdpb::{
-    AdminCmdType, AdminRequest, CmdType, RaftCmdRequest, RaftCmdResponse, Request, StatusCmdType,
-    StatusResponse,
+    AdminCmdType, AdminRequest, CmdType, RaftCmdRequest, RaftCmdResponse, RaftRequestHeader,
+    Request, StatusCmdType, StatusResponse,
 };
 use kvproto::raft_serverpb::{
     ExtraMessageType, MergeState, PeerState, RaftMessage, RaftSnapshotData, RaftTruncatedState,
@@ -118,11 +118,11 @@ pub struct BatchRaftCmdRequestBuilder<S>
 where
     S: Snapshot,
 {
-    raft_entry_max_size: f64,
-    batch_req_size: u32,
-    request: Option<RaftCmdRequest>,
-    callbacks: Vec<(Callback<S>, usize)>,
-    txn_extra: TxnExtra,
+    raft_entry_max_size: usize,
+    last_data: Vec<u8>,
+    last_header: Option<RaftRequestHeader>,
+    callbacks: Vec<Callback<S>>,
+    wb: RawWriteBatch,
 }
 
 impl<EK, ER> Drop for PeerFsm<EK, ER>
@@ -197,7 +197,7 @@ where
                 receiver: rx,
                 skip_split_count: 0,
                 batch_req_builder: BatchRaftCmdRequestBuilder::new(
-                    cfg.raft_entry_max_size.0 as f64,
+                    cfg.raft_entry_max_size.0 as usize,
                 ),
             }),
         ))
@@ -239,7 +239,7 @@ where
                 receiver: rx,
                 skip_split_count: 0,
                 batch_req_builder: BatchRaftCmdRequestBuilder::new(
-                    cfg.raft_entry_max_size.0 as f64,
+                    cfg.raft_entry_max_size.0 as usize,
                 ),
             }),
         ))
@@ -278,109 +278,70 @@ impl<S> BatchRaftCmdRequestBuilder<S>
 where
     S: Snapshot,
 {
-    fn new(raft_entry_max_size: f64) -> BatchRaftCmdRequestBuilder<S> {
+    fn new(raft_entry_max_size: usize) -> BatchRaftCmdRequestBuilder<S> {
+        let wb = RawWriteBatch::new();
         BatchRaftCmdRequestBuilder {
             raft_entry_max_size,
-            request: None,
-            batch_req_size: 0,
             callbacks: vec![],
-            txn_extra: TxnExtra::default(),
+            last_data: vec![],
+            last_header: None,
+            wb,
         }
     }
 
-    fn can_batch(&self, req: &RaftCmdRequest, req_size: u32) -> bool {
+    fn can_batch(&self, header: &RaftRequestHeader, data: &[u8]) -> bool {
         // No batch request whose size exceed 20% of raft_entry_max_size,
         // so total size of request in batch_raft_request would not exceed
-        // (40% + 20%) of raft_entry_max_size
-        if req.get_requests().is_empty() || f64::from(req_size) > self.raft_entry_max_size * 0.2 {
-            return false;
-        }
-        for r in req.get_requests() {
-            match r.get_cmd_type() {
-                CmdType::Delete | CmdType::Put => (),
-                _ => {
-                    return false;
-                }
-            }
-        }
-
-        if let Some(batch_req) = self.request.as_ref() {
-            if batch_req.get_header() != req.get_header() {
-                return false;
-            }
-        }
-        true
+        // (50% + 10%) of raft_entry_max_size.
+        data.len() < self.raft_entry_max_size / 10
+            && self
+                .last_header
+                .as_ref()
+                .map_or(true, |last_header| header == last_header)
     }
 
-    fn add(&mut self, cmd: RaftCommand<S>, req_size: u32) {
-        let req_num = cmd.request.get_requests().len();
-        let RaftCommand {
-            mut request,
-            callback,
-            mut txn_extra,
-            ..
-        } = cmd;
-        if let Some(batch_req) = self.request.as_mut() {
-            let requests: Vec<_> = request.take_requests().into();
-            for q in requests {
-                batch_req.mut_requests().push(q);
-            }
+    fn add(&mut self, header: RaftRequestHeader, data: Vec<u8>, cb: Callback<S>) {
+        if self.last_header.is_none() {
+            self.last_header = Some(header);
+            self.last_data = data;
         } else {
-            self.request = Some(request);
-        };
-        self.callbacks.push((callback, req_num));
-        self.batch_req_size += req_size;
-        self.txn_extra.extend(&mut txn_extra);
+            if !self.last_data.is_empty() {
+                self.wb.append(&self.last_data);
+                self.last_data.clear();
+            }
+            self.wb.append(&data);
+        }
+        self.callbacks.push(cb);
     }
 
     fn should_finish(&self) -> bool {
-        if let Some(batch_req) = self.request.as_ref() {
-            // Limit the size of batch request so that it will not exceed raft_entry_max_size after
-            // adding header.
-            if f64::from(self.batch_req_size) > self.raft_entry_max_size * 0.4 {
-                return true;
-            }
-            if batch_req.get_requests().len() > RocksEngine::WRITE_BATCH_MAX_KEYS {
-                return true;
-            }
-        }
-        false
+        // Limit the size of batch request so that it will not exceed raft_entry_max_size after
+        // adding header.
+        self.wb.data_size() > self.raft_entry_max_size / 2
+            || self.wb.count() > RocksEngine::WRITE_BATCH_MAX_KEYS
     }
 
-    fn build(&mut self, metric: &mut RaftProposeMetrics) -> Option<RaftCommand<S>> {
-        if let Some(req) = self.request.take() {
-            self.batch_req_size = 0;
-            if self.callbacks.len() == 1 {
-                let (cb, _) = self.callbacks.pop().unwrap();
-                return Some(RaftCommand::with_txn_extra(
-                    req,
-                    cb,
-                    std::mem::take(&mut self.txn_extra),
-                ));
+    fn build(
+        &mut self,
+        metric: &mut RaftProposeMetrics,
+    ) -> Option<(RaftRequestHeader, Vec<u8>, Callback<S>)> {
+        if let Some(header) = self.last_header.take() {
+            if !self.last_data.is_empty() {
+                let cb = self.callbacks.pop().unwrap();
+                let data = util::encode_entry_data(header.get_region_epoch(), &self.last_data);
+                self.last_data.clear();
+                return Some((header, data, cb));
             }
             metric.batch += self.callbacks.len() - 1;
             let cbs = std::mem::replace(&mut self.callbacks, vec![]);
-            let cb = Callback::Write(Box::new(move |resp| {
-                let mut last_index = 0;
-                let has_error = resp.response.get_header().has_error();
-                for (cb, req_num) in cbs {
-                    let next_index = last_index + req_num;
-                    let mut cmd_resp = RaftCmdResponse::default();
-                    cmd_resp.set_header(resp.response.get_header().clone());
-                    if !has_error {
-                        cmd_resp.set_responses(
-                            resp.response.get_responses()[last_index..next_index].into(),
-                        );
-                    }
-                    cb.invoke_with_response(cmd_resp);
-                    last_index = next_index;
+            let callback = Callback::Write(Box::new(move |resp| {
+                for cb in cbs {
+                    cb.invoke_with_response(resp.response.clone());
                 }
             }));
-            return Some(RaftCommand::with_txn_extra(
-                req,
-                cb,
-                std::mem::take(&mut self.txn_extra),
-            ));
+            let data = util::encode_entry_data(header.get_region_epoch(), self.wb.data());
+            self.wb.clear();
+            return Some((header, data, callback));
         }
         None
     }
@@ -458,15 +419,27 @@ where
                         .propose
                         .request_wait_time
                         .observe(duration_to_sec(cmd.send_time.elapsed()) as f64);
-                    let req_size = cmd.request.compute_size();
-                    if self.fsm.batch_req_builder.can_batch(&cmd.request, req_size) {
-                        self.fsm.batch_req_builder.add(cmd, req_size);
+                    self.propose_batch_raft_command();
+                    self.propose_raft_command(cmd.request, cmd.callback, cmd.txn_extra)
+                }
+                PeerMsg::RaftRawCommand(cmd) => {
+                    self.ctx
+                        .raft_metrics
+                        .propose
+                        .request_wait_time
+                        .observe(duration_to_sec(cmd.send_time.elapsed()) as f64);
+                    if self.fsm.batch_req_builder.can_batch(&cmd.header, &cmd.data) {
+                        self.fsm
+                            .batch_req_builder
+                            .add(cmd.header, cmd.data, cmd.callback);
                         if self.fsm.batch_req_builder.should_finish() {
                             self.propose_batch_raft_command();
                         }
                     } else {
                         self.propose_batch_raft_command();
-                        self.propose_raft_command(cmd.request, cmd.callback, cmd.txn_extra)
+                        let data =
+                            util::encode_entry_data(cmd.header.get_region_epoch(), &cmd.data);
+                        self.propose_write_raft_command(cmd.header, data, cmd.callback)
                     }
                 }
                 PeerMsg::Tick(tick) => self.on_tick(tick),
@@ -490,12 +463,12 @@ where
     }
 
     fn propose_batch_raft_command(&mut self) {
-        if let Some(cmd) = self
+        if let Some((header, data, cb)) = self
             .fsm
             .batch_req_builder
             .build(&mut self.ctx.raft_metrics.propose)
         {
-            self.propose_raft_command(cmd.request, cmd.callback, cmd.txn_extra)
+            self.propose_write_raft_command(header, data, cb)
         }
     }
 
@@ -2887,37 +2860,15 @@ where
         Ok(())
     }
 
-    fn pre_propose_raft_command(
+    fn check_header(
         &mut self,
-        msg: &RaftCmdRequest,
-    ) -> Result<Option<RaftCmdResponse>> {
-        // Check store_id, make sure that the msg is dispatched to the right place.
-        if let Err(e) = util::check_store_id(msg, self.store_id()) {
-            self.ctx.raft_metrics.invalid_proposal.mismatch_store_id += 1;
-            return Err(e);
-        }
-        if msg.has_status_request() {
-            // For status commands, we handle it here directly.
-            let resp = self.execute_status_command(msg)?;
-            return Ok(Some(resp));
-        }
-
-        // Check whether the store has the right peer to handle the request.
+        header: &RaftRequestHeader,
+        read_only: bool,
+        is_read_index_request: bool,
+    ) -> Result<()> {
+        let allow_replica_read = read_only && header.get_replica_read();
         let region_id = self.region_id();
         let leader_id = self.fsm.peer.leader_id();
-        let request = msg.get_requests();
-
-        // ReadIndex can be processed on the replicas.
-        let is_read_index_request =
-            request.len() == 1 && request[0].get_cmd_type() == CmdType::ReadIndex;
-        let mut read_only = true;
-        for r in msg.get_requests() {
-            match r.get_cmd_type() {
-                CmdType::Get | CmdType::Snap | CmdType::ReadIndex => (),
-                _ => read_only = false,
-            }
-        }
-        let allow_replica_read = read_only && msg.get_header().get_replica_read();
         if !(self.fsm.peer.is_leader() || is_read_index_request || allow_replica_read) {
             self.ctx.raft_metrics.invalid_proposal.not_leader += 1;
             let leader = self.fsm.peer.get_peer_from_cache(leader_id);
@@ -2926,7 +2877,7 @@ where
             return Err(Error::NotLeader(region_id, leader));
         }
         // peer_id must be the same as peer's.
-        if let Err(e) = util::check_peer_id(msg, self.fsm.peer.peer_id()) {
+        if let Err(e) = util::check_peer_id(header, self.fsm.peer.peer_id()) {
             self.ctx.raft_metrics.invalid_proposal.mismatch_peer_id += 1;
             return Err(e);
         }
@@ -2949,11 +2900,41 @@ where
             )));
         }
         // Check whether the term is stale.
-        if let Err(e) = util::check_term(msg, self.fsm.peer.term()) {
+        if let Err(e) = util::check_term(header, self.fsm.peer.term()) {
             self.ctx.raft_metrics.invalid_proposal.stale_command += 1;
             return Err(e);
         }
+        Ok(())
+    }
+    fn pre_propose_raft_command(
+        &mut self,
+        msg: &RaftCmdRequest,
+    ) -> Result<Option<RaftCmdResponse>> {
+        // Check store_id, make sure that the msg is dispatched to the right place.
+        if let Err(e) = util::check_store_id(msg.get_header(), self.store_id()) {
+            self.ctx.raft_metrics.invalid_proposal.mismatch_store_id += 1;
+            return Err(e);
+        }
+        if msg.has_status_request() {
+            // For status commands, we handle it here directly.
+            let resp = self.execute_status_command(msg)?;
+            return Ok(Some(resp));
+        }
 
+        // Check whether the store has the right peer to handle the request.
+        let request = msg.get_requests();
+
+        // ReadIndex can be processed on the replicas.
+        let is_read_index_request =
+            request.len() == 1 && request[0].get_cmd_type() == CmdType::ReadIndex;
+        let mut read_only = true;
+        for r in msg.get_requests() {
+            match r.get_cmd_type() {
+                CmdType::Get | CmdType::Snap | CmdType::ReadIndex => (),
+                _ => read_only = false,
+            }
+        }
+        self.check_header(msg.get_header(), read_only, is_read_index_request)?;
         match util::check_region_epoch(msg, self.fsm.peer.region(), true) {
             Err(Error::EpochNotMatch(msg, mut new_regions)) => {
                 // Attach the region which might be split from the current region. But it doesn't
@@ -2970,6 +2951,58 @@ where
             Err(e) => Err(e),
             Ok(()) => Ok(None),
         }
+    }
+    fn check_write_raft_command(&mut self, header: &RaftRequestHeader) -> Result<()> {
+        if let Err(e) = util::check_store_id(header, self.store_id()) {
+            self.ctx.raft_metrics.invalid_proposal.mismatch_store_id += 1;
+            return Err(e);
+        }
+
+        self.check_header(header, false, false)?;
+
+        let epoch = header.get_region_epoch();
+        match util::compare_region_epoch(epoch, self.fsm.peer.region(), false, true, true) {
+            Err(Error::EpochNotMatch(msg, mut new_regions)) => {
+                // Attach the region which might be split from the current region. But it doesn't
+                // matter if the region is not split from the current region. If the region meta
+                // received by the TiKV driver is newer than the meta cached in the driver, the meta is
+                // updated.
+                let sibling_region = self.find_sibling_region();
+                if let Some(sibling_region) = sibling_region {
+                    new_regions.push(sibling_region);
+                }
+                self.ctx.raft_metrics.invalid_proposal.epoch_not_match += 1;
+                Err(Error::EpochNotMatch(msg, new_regions))
+            }
+            Err(e) => Err(e),
+            Ok(()) => Ok(()),
+        }
+    }
+
+    fn propose_write_raft_command(
+        &mut self,
+        header: RaftRequestHeader,
+        data: Vec<u8>,
+        cb: Callback<EK::Snapshot>,
+    ) {
+        if let Err(e) = self.check_write_raft_command(&header) {
+            debug!(
+                   "failed to propose";
+                   "region_id" => self.region_id(),
+                   "peer_id" => self.fsm.peer_id(),
+                   "message" => ?header,
+                   "err" => %e,
+            );
+            cb.invoke_with_response(new_error(e));
+            return;
+        }
+        if self.fsm.peer.propose_write(self.ctx, data, cb) {
+            self.fsm.has_ready = true;
+        }
+        if self.fsm.peer.should_wake_up {
+            self.reset_raft_tick(GroupState::Ordered);
+        }
+        self.register_pd_heartbeat_tick();
     }
 
     fn propose_raft_command(

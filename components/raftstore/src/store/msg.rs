@@ -9,7 +9,7 @@ use kvproto::kvrpcpb::ExtraOp as TxnExtraOp;
 use kvproto::metapb;
 use kvproto::metapb::RegionEpoch;
 use kvproto::pdpb::CheckPolicy;
-use kvproto::raft_cmdpb::{RaftCmdRequest, RaftCmdResponse};
+use kvproto::raft_cmdpb::{RaftCmdRequest, RaftCmdResponse, RaftRequestHeader};
 use kvproto::raft_serverpb::RaftMessage;
 use kvproto::replication_modepb::ReplicationStatus;
 use raft::SnapshotStatus;
@@ -348,6 +348,31 @@ impl<S: Snapshot> RaftCommand<S> {
     }
 }
 
+/// Raft command is the command that is expected to be proposed by the
+/// leader of the target raft group.
+pub struct RaftRawCommand<S: Snapshot> {
+    pub send_time: Instant,
+    pub header: RaftRequestHeader,
+    pub data: Vec<u8>,
+    pub callback: Callback<S>,
+}
+
+impl<S: Snapshot> RaftRawCommand<S> {
+    #[inline]
+    pub fn new(
+        header: RaftRequestHeader,
+        data: Vec<u8>,
+        callback: Callback<S>,
+    ) -> RaftRawCommand<S> {
+        RaftRawCommand {
+            send_time: Instant::now(),
+            header,
+            data,
+            callback,
+        }
+    }
+}
+
 /// Message that can be sent to a peer.
 pub enum PeerMsg<EK: KvEngine> {
     /// Raft message is the message sent between raft nodes in the same
@@ -358,11 +383,14 @@ pub enum PeerMsg<EK: KvEngine> {
     /// leader of the target raft group. If it's failed to be sent, callback
     /// usually needs to be called before dropping in case of resource leak.
     RaftCommand(RaftCommand<EK::Snapshot>),
+    RaftRawCommand(RaftRawCommand<EK::Snapshot>),
     /// Tick is periodical task. If target peer doesn't exist there is a potential
     /// that the raft node will not work anymore.
     Tick(PeerTicks),
     /// Result of applying committed entries. The message can't be lost.
-    ApplyRes { res: ApplyTaskRes<EK::Snapshot> },
+    ApplyRes {
+        res: ApplyTaskRes<EK::Snapshot>,
+    },
     /// Message that can't be lost but rarely created. If they are lost, real bad
     /// things happen like some peers will be considered dead in the group.
     SignificantMsg(SignificantMsg<EK::Snapshot>),
@@ -383,6 +411,7 @@ impl<EK: KvEngine> fmt::Debug for PeerMsg<EK> {
         match self {
             PeerMsg::RaftMessage(_) => write!(fmt, "Raft Message"),
             PeerMsg::RaftCommand(_) => write!(fmt, "Raft Command"),
+            PeerMsg::RaftRawCommand(_) => write!(fmt, "Raft Raw Command"),
             PeerMsg::Tick(tick) => write! {
                 fmt,
                 "{:?}",

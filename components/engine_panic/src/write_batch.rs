@@ -17,17 +17,10 @@ impl WriteBatchExt for PanicEngine {
         panic!()
     }
 
-    fn write_vec_opt(&self, wb: &Self::WriteBatchVec, opts: &WriteOptions) -> Result<()> {
-        panic!()
-    }
-
     fn write_batch(&self) -> Self::WriteBatch {
         panic!()
     }
     fn write_batch_with_cap(&self, cap: usize) -> Self::WriteBatch {
-        panic!()
-    }
-    fn write_batch_vec(&self, vec_size: usize, cap: usize) -> Self::WriteBatchVec {
         panic!()
     }
 }

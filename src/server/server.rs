@@ -287,7 +287,7 @@ mod tests {
 
     use crate::storage::lock_manager::DummyLockManager;
     use engine_rocks::RocksSnapshot;
-    use kvproto::raft_cmdpb::RaftCmdRequest;
+    use kvproto::raft_cmdpb::{RaftCmdRequest, RaftRequestHeader};
     use kvproto::raft_serverpb::RaftMessage;
     use security::SecurityConfig;
     use txn_types::TxnExtra;
@@ -320,6 +320,15 @@ mod tests {
 
     impl RaftStoreRouter<RocksEngine> for TestRaftStoreRouter {
         fn send_raft_msg(&self, _: RaftMessage) -> RaftStoreResult<()> {
+            self.tx.send(1).unwrap();
+            Ok(())
+        }
+        fn send_raw_command(
+            &self,
+            _: RaftRequestHeader,
+            _: Vec<u8>,
+            _: Callback<RocksSnapshot>,
+        ) -> RaftStoreResult<()> {
             self.tx.send(1).unwrap();
             Ok(())
         }

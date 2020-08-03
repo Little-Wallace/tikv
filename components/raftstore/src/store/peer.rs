@@ -1528,10 +1528,13 @@ where
                         if data.is_empty() || entry.get_entry_type() != EntryType::EntryNormal {
                             false
                         } else {
-                            let cmd: RaftCmdRequest = util::parse_data_at(data, index, &self.tag);
-                            cmd.has_admin_request()
-                                && cmd.get_admin_request().get_cmd_type()
-                                    == AdminCmdType::RollbackMerge
+                            if let util::EntryCommand::PBRaftCmdRequest(cmd) =
+                                util::decode_entry_data(data, index, &self.tag)
+                            {
+                                cmd.has_admin_request()
+                            } else {
+                                false
+                            }
                         }
                     },
                     |_| {}
@@ -2397,6 +2400,73 @@ where
         Ok(ctx)
     }
 
+    fn propose_entry<T, C>(
+        &mut self,
+        poll_ctx: &mut PollContext<EK, ER, T, C>,
+        ctx: ProposalContext,
+        data: Vec<u8>,
+    ) -> Result<u64> {
+        // TODO: use local histogram metrics
+        PEER_PROPOSE_LOG_SIZE_HISTOGRAM.observe(data.len() as f64);
+
+        if data.len() as u64 > poll_ctx.cfg.raft_entry_max_size.0 {
+            error!(
+                "entry is too large";
+                "region_id" => self.region_id,
+                "peer_id" => self.peer.get_id(),
+                "size" => data.len(),
+            );
+            return Err(Error::RaftEntryTooLarge(self.region_id, data.len() as u64));
+        }
+
+        let propose_index = self.next_proposal_index();
+        self.raft_group.propose(ctx.to_vec(), data)?;
+        if self.next_proposal_index() == propose_index {
+            // The message is dropped silently, this usually due to leader absence
+            // or transferring leader. Both cases can be considered as NotLeader error.
+            return Err(Error::NotLeader(self.region_id, None));
+        }
+
+        if ctx.contains(ProposalContext::PREPARE_MERGE) {
+            self.last_proposed_prepare_merge_idx = propose_index;
+        }
+        Ok(propose_index)
+    }
+
+    pub fn propose_write<T, C>(
+        &mut self,
+        poll_ctx: &mut PollContext<EK, ER, T, C>,
+        data: Vec<u8>,
+        cb: Callback<EK::Snapshot>,
+    ) -> bool {
+        if self.pending_merge_state.is_some() {
+            let e: Error = box_err!("{} peer in merging mode, can't do proposal.", self.tag);
+            cb.invoke_with_response(cmd_resp::new_error(e));
+            return false;
+        }
+
+        poll_ctx.raft_metrics.propose.normal += 1;
+        let ctx = ProposalContext::empty();
+        match self.propose_entry(poll_ctx, ctx, data) {
+            Err(e) => {
+                cb.invoke_with_response(cmd_resp::new_error(e));
+                false
+            }
+            Ok(idx) => {
+                self.should_wake_up = true;
+                let p = Proposal {
+                    is_conf_change: false,
+                    index: idx,
+                    term: self.term(),
+                    cb,
+                    renew_lease_time: None,
+                    txn_extra: TxnExtra::default(),
+                };
+                self.post_propose(poll_ctx, p);
+                true
+            }
+        }
+    }
     fn propose_normal<T, C>(
         &mut self,
         poll_ctx: &mut PollContext<EK, ER, T, C>,
@@ -2427,33 +2497,7 @@ where
             }
         };
         let data = req.write_to_bytes()?;
-
-        // TODO: use local histogram metrics
-        PEER_PROPOSE_LOG_SIZE_HISTOGRAM.observe(data.len() as f64);
-
-        if data.len() as u64 > poll_ctx.cfg.raft_entry_max_size.0 {
-            error!(
-                "entry is too large";
-                "region_id" => self.region_id,
-                "peer_id" => self.peer.get_id(),
-                "size" => data.len(),
-            );
-            return Err(Error::RaftEntryTooLarge(self.region_id, data.len() as u64));
-        }
-
-        let propose_index = self.next_proposal_index();
-        self.raft_group.propose(ctx.to_vec(), data)?;
-        if self.next_proposal_index() == propose_index {
-            // The message is dropped silently, this usually due to leader absence
-            // or transferring leader. Both cases can be considered as NotLeader error.
-            return Err(Error::NotLeader(self.region_id, None));
-        }
-
-        if ctx.contains(ProposalContext::PREPARE_MERGE) {
-            self.last_proposed_prepare_merge_idx = propose_index;
-        }
-
-        Ok(propose_index)
+        self.propose_entry(poll_ctx, ctx, data)
     }
 
     fn execute_transfer_leader<T, C>(

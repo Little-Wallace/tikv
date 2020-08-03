@@ -5,14 +5,18 @@ use std::sync::Arc;
 use crate::engine::RocksEngine;
 use crate::options::RocksWriteOptions;
 use crate::util::get_cf_handle;
-use engine_traits::{self, Error, Mutable, Result, WriteBatchExt, WriteBatchVecExt, WriteOptions};
-use rocksdb::{Writable, WriteBatch as RawWriteBatch, DB};
+use engine_traits::{
+    self, Error, Mutable, Result, ValueType, WriteBatchExt, WriteBatchVecExt, WriteOptions,
+};
+pub use rocksdb::WriteBatch as RawWriteBatch;
+use rocksdb::{DBValueType, Writable, WriteBatchIter, WriteBatchRef, DB};
 
-const WRITE_BATCH_MAX_BATCH: usize = 16;
+pub const WRITE_BATCH_BATCH_MAX_SIZE: usize = 16;
+pub const WRITE_BATCH_MAX_DATA_SIZE: usize = 8 * 1024;
+pub const WRITE_BATCH_MAX_BATCH_COUNT: usize = 16;
 
 impl WriteBatchExt for RocksEngine {
     type WriteBatch = RocksWriteBatch;
-    type WriteBatchVec = RocksWriteBatchVec;
 
     const WRITE_BATCH_MAX_KEYS: usize = 256;
 
@@ -28,19 +32,6 @@ impl WriteBatchExt for RocksEngine {
             .map_err(Error::Engine)
     }
 
-    fn write_vec_opt(&self, wb: &RocksWriteBatchVec, opts: &WriteOptions) -> Result<()> {
-        let opt: RocksWriteOptions = opts.into();
-        if wb.index > 0 {
-            self.as_inner()
-                .multi_batch_write(wb.as_inner(), &opt.into_raw())
-                .map_err(Error::Engine)
-        } else {
-            self.as_inner()
-                .write_opt(&wb.wbs[0], &opt.into_raw())
-                .map_err(Error::Engine)
-        }
-    }
-
     fn support_write_batch_vec(&self) -> bool {
         let options = self.as_inner().get_db_options();
         options.is_enable_multi_batch_write()
@@ -52,10 +43,6 @@ impl WriteBatchExt for RocksEngine {
 
     fn write_batch_with_cap(&self, cap: usize) -> Self::WriteBatch {
         Self::WriteBatch::with_capacity(Arc::clone(&self.as_inner()), cap)
-    }
-
-    fn write_batch_vec(&self, vec_size: usize, cap: usize) -> Self::WriteBatchVec {
-        RocksWriteBatchVec::new(Arc::clone(&self.as_inner()), vec_size, cap)
     }
 }
 
@@ -99,6 +86,10 @@ impl engine_traits::WriteBatch for RocksWriteBatch {
         self.wb.data_size()
     }
 
+    fn data(&self) -> &[u8] {
+        self.wb.data()
+    }
+
     fn count(&self) -> usize {
         self.wb.count()
     }
@@ -109,6 +100,11 @@ impl engine_traits::WriteBatch for RocksWriteBatch {
 
     fn should_write_to_engine(&self) -> bool {
         self.wb.count() > RocksEngine::WRITE_BATCH_MAX_KEYS
+    }
+
+    fn append(&mut self, data: &[u8]) -> Result<()> {
+        self.wb.append(data);
+        Ok(())
     }
 
     fn clear(&mut self) {
@@ -166,20 +162,20 @@ pub struct RocksWriteBatchVec {
     wbs: Vec<RawWriteBatch>,
     save_points: Vec<usize>,
     index: usize,
-    cur_batch_size: usize,
-    batch_size_limit: usize,
+    total_count: usize,
+    cap: usize,
 }
 
 impl RocksWriteBatchVec {
-    pub fn new(db: Arc<DB>, batch_size_limit: usize, cap: usize) -> RocksWriteBatchVec {
+    pub fn new(db: Arc<DB>, cap: usize) -> RocksWriteBatchVec {
         let wb = RawWriteBatch::with_capacity(cap);
         RocksWriteBatchVec {
             db,
             wbs: vec![wb],
             save_points: vec![],
             index: 0,
-            cur_batch_size: 0,
-            batch_size_limit,
+            total_count: 0,
+            cap,
         }
     }
 
@@ -198,24 +194,30 @@ impl RocksWriteBatchVec {
     /// `check_switch_batch` will split a large WriteBatch into many smaller ones. This is to avoid
     /// a large WriteBatch blocking write_thread too long.
     fn check_switch_batch(&mut self) {
-        if self.batch_size_limit > 0 && self.cur_batch_size >= self.batch_size_limit {
+        let cur_count = self.wbs[self.index].count();
+        if cur_count >= WRITE_BATCH_BATCH_MAX_SIZE {
             self.index += 1;
-            self.cur_batch_size = 0;
+            self.total_count += cur_count;
             if self.index >= self.wbs.len() {
-                self.wbs.push(RawWriteBatch::default());
+                self.wbs.push(RawWriteBatch::with_capacity(self.cap));
             }
         }
-        self.cur_batch_size += 1;
     }
 }
 
 impl engine_traits::WriteBatch for RocksWriteBatchVec {
     fn data_size(&self) -> usize {
-        self.wbs.iter().fold(0, |a, b| a + b.data_size())
+        self.wbs[0..=self.index]
+            .iter()
+            .fold(0, |a, b| a + b.data_size())
+    }
+
+    fn data(&self) -> &[u8] {
+        panic!()
     }
 
     fn count(&self) -> usize {
-        self.cur_batch_size + self.index * self.batch_size_limit
+        self.wbs[self.index].count() + self.total_count
     }
 
     fn is_empty(&self) -> bool {
@@ -223,7 +225,39 @@ impl engine_traits::WriteBatch for RocksWriteBatchVec {
     }
 
     fn should_write_to_engine(&self) -> bool {
-        self.index >= WRITE_BATCH_MAX_BATCH
+        self.index >= WRITE_BATCH_MAX_BATCH_COUNT
+    }
+
+    fn append(&mut self, data: &[u8]) -> Result<()> {
+        if data.len() > WRITE_BATCH_MAX_DATA_SIZE {
+            let wb_ref = WriteBatchRef::new(data);
+            if wb_ref.count() > WRITE_BATCH_BATCH_MAX_SIZE * 2 {
+                for (tp, cf_id, key, value) in wb_ref.iter() {
+                    self.check_switch_batch();
+                    let handle = self
+                        .db
+                        .cf_handle_by_id(cf_id as usize)
+                        .ok_or_else(|| Error::Engine(format!("cf {} not found", cf_id)))?;
+                    match tp {
+                        DBValueType::TypeValue => {
+                            self.wbs[self.index]
+                                .put_cf(handle, key, value)
+                                .map_err(Error::Engine)?;
+                        }
+                        DBValueType::TypeDeletion => {
+                            self.wbs[self.index]
+                                .delete_cf(handle, key)
+                                .map_err(Error::Engine)?;
+                        }
+                        _ => {}
+                    }
+                }
+                return Ok(());
+            }
+        }
+        self.check_switch_batch();
+        self.wbs[self.index].append(data);
+        Ok(())
     }
 
     fn clear(&mut self) {
@@ -232,7 +266,7 @@ impl engine_traits::WriteBatch for RocksWriteBatchVec {
         }
         self.save_points.clear();
         self.index = 0;
-        self.cur_batch_size = 0;
+        self.total_count = 0;
     }
 
     fn set_save_point(&mut self) {
@@ -294,8 +328,9 @@ impl Mutable for RocksWriteBatchVec {
             .map_err(Error::Engine)
     }
 }
+
 impl WriteBatchVecExt<RocksEngine> for RocksWriteBatch {
-    fn write_batch_vec(e: &RocksEngine, _vec_size: usize, cap: usize) -> RocksWriteBatch {
+    fn write_batch_vec(e: &RocksEngine, cap: usize) -> RocksWriteBatch {
         e.write_batch_with_cap(cap)
     }
 
@@ -305,21 +340,78 @@ impl WriteBatchVecExt<RocksEngine> for RocksWriteBatch {
 }
 
 impl WriteBatchVecExt<RocksEngine> for RocksWriteBatchVec {
-    fn write_batch_vec(e: &RocksEngine, vec_size: usize, cap: usize) -> RocksWriteBatchVec {
-        e.write_batch_vec(vec_size, cap)
+    fn write_batch_vec(e: &RocksEngine, cap: usize) -> RocksWriteBatchVec {
+        RocksWriteBatchVec::new(e.as_inner().clone(), cap)
     }
 
     fn write_to_engine(&self, e: &RocksEngine, opts: &WriteOptions) -> Result<()> {
-        e.write_vec_opt(self, opts)
+        let opt: RocksWriteOptions = opts.into();
+        if self.index > 0 {
+            e.as_inner()
+                .multi_batch_write(self.as_inner(), &opt.into_raw())
+                .map_err(Error::Engine)
+        } else {
+            e.as_inner()
+                .write_opt(&self.wbs[0], &opt.into_raw())
+                .map_err(Error::Engine)
+        }
+    }
+}
+
+pub struct RocksWriteBatchIter<'a, 'b> {
+    cfs: &'a [String],
+    inner: WriteBatchIter<'b>,
+}
+
+impl<'a, 'b> Iterator for RocksWriteBatchIter<'a, 'b> {
+    type Item = (ValueType, &'a str, &'b [u8], &'b [u8]);
+
+    fn next(&mut self) -> Option<(ValueType, &'a str, &'b [u8], &'b [u8])> {
+        self.inner.next().map(|(t, cf_id, key, value)| {
+            let value_type = match t {
+                DBValueType::TypeDeletion => ValueType::Delete,
+                DBValueType::TypeValue => ValueType::Put,
+                DBValueType::TypeRangeDeletion => ValueType::DeleteRange,
+                _ => ValueType::Invalid,
+            };
+            let cf = self.cfs[cf_id as usize].as_str();
+            (value_type, cf, key, value)
+        })
+    }
+}
+
+#[derive(Clone)]
+pub struct RocksWriteBatchReader {
+    cfs: Vec<String>,
+}
+
+impl RocksWriteBatchReader {
+    pub fn new(cfs: Vec<String>) -> RocksWriteBatchReader {
+        RocksWriteBatchReader { cfs }
+    }
+
+    pub fn iter<'a, 'b>(&'a self, data: &'b [u8]) -> RocksWriteBatchIter<'a, 'b> {
+        let wb = WriteBatchRef::new(data);
+        let inner = wb.iter();
+        RocksWriteBatchIter {
+            cfs: self.cfs.as_ref(),
+            inner,
+        }
+    }
+
+    pub fn count(data: &[u8]) -> usize {
+        let wb = WriteBatchRef::new(data);
+        wb.count()
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::super::util::new_engine_opt;
+    use super::super::util::{new_engine, new_engine_opt};
     use super::super::RocksDBOptions;
     use super::*;
-    use engine_traits::WriteBatch;
+    use engine_traits::WriteBatchVecExt;
+    use engine_traits::{CFNamesExt, Peekable, SyncMutable, WriteBatch};
     use rocksdb::DBOptions as RawDBOptions;
     use tempfile::Builder;
 
@@ -341,14 +433,14 @@ mod tests {
         .unwrap();
         assert!(engine.support_write_batch_vec());
         let mut wb = engine.write_batch();
-        for _i in 0..RocksEngine::WRITE_BATCH_MAX_KEYS {
+        for _i in 0..WRITE_BATCH_MAX_KEYS {
             wb.put(b"aaa", b"bbb").unwrap();
         }
         assert!(!wb.should_write_to_engine());
         wb.put(b"aaa", b"bbb").unwrap();
         assert!(wb.should_write_to_engine());
-        let mut wb = engine.write_batch_vec(4, 1024);
-        for _i in 0..WRITE_BATCH_MAX_BATCH * 4 {
+        let mut wb: RocksWriteBatchVec = WriteBatchVecExt::write_batch_vec(&engine, 1024);
+        for _i in 0..WRITE_BATCH_MAX_BATCH_COUNT * WRITE_BATCH_BATCH_MAX_SIZE {
             wb.put(b"aaa", b"bbb").unwrap();
         }
         assert!(!wb.should_write_to_engine());
@@ -356,5 +448,41 @@ mod tests {
         assert!(wb.should_write_to_engine());
         wb.clear();
         assert!(!wb.should_write_to_engine());
+    }
+
+    #[test]
+    fn test_write_batch_reader_iter() {
+        let path = Builder::new()
+            .prefix("test-writebatch-iter")
+            .tempdir()
+            .unwrap();
+        let engine = new_engine(
+            path.path().join("db").to_str().unwrap(),
+            None,
+            &["default", "cf1", "cf2"],
+            None,
+        )
+        .unwrap();
+        let cfs = engine.cf_names().iter().map(|cf| cf.to_string()).collect();
+        let mut wb = engine.write_batch();
+        engine.put_cf("cf1", b"k1", b"v0").unwrap();
+        engine.put_cf("cf2", b"k2", b"v0").unwrap();
+        assert!(engine.get_value_cf("cf1", b"k1").unwrap().is_some());
+        assert!(engine.get_value_cf("cf2", b"k2").unwrap().is_some());
+        wb.delete_cf("cf1", b"k1").unwrap();
+        wb.delete_cf("cf2", b"k2").unwrap();
+        wb.put_cf("default", b"k3", b"v0").unwrap();
+        let reader = RocksWriteBatchReader::new(cfs);
+        assert_eq!(3, RocksWriteBatchReader::count(wb.data()));
+        for (t, cf, k, v) in reader.iter(wb.data()) {
+            match t {
+                ValueType::Put => engine.put_cf(cf, k, v).unwrap(),
+                ValueType::Delete => engine.delete_cf(cf, k).unwrap(),
+                _ => (),
+            }
+        }
+        assert_eq!(&*engine.get_value(b"k3").unwrap().unwrap(), b"v0");
+        assert!(engine.get_value_cf("cf1", b"k1").unwrap().is_none());
+        assert!(engine.get_value_cf("cf2", b"k2").unwrap().is_none());
     }
 }

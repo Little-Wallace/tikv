@@ -57,6 +57,6 @@ pub trait KvEngine:
 }
 
 pub trait WriteBatchVecExt<E: KvEngine> {
-    fn write_batch_vec(e: &E, vec_size: usize, cap: usize) -> Self;
+    fn write_batch_vec(e: &E, cap: usize) -> Self;
     fn write_to_engine(&self, e: &E, opts: &WriteOptions) -> Result<()>;
 }

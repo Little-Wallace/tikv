@@ -69,6 +69,21 @@ impl RaftStoreRouter<RocksEngine> for SyncBenchRouter {
         Ok(())
     }
 
+    fn send_raw_command(
+        &self,
+        header: RaftRequestHeader,
+        _data: Vec<u8>,
+        cb: Callback<RocksSnapshot>,
+    ) -> Result<()> {
+        let mut req = RaftCmdRequest::default();
+        let mut q = Request::default();
+        q.set_cmd_type(CmdType::Put);
+        req.set_header(header);
+        req.mut_requests().push(q);
+        self.invoke(RaftCommand::new(req, cb));
+        Ok(())
+    }
+
     fn send_command(&self, req: RaftCmdRequest, cb: Callback<RocksSnapshot>) -> Result<()> {
         self.invoke(RaftCommand::new(req, cb));
         Ok(())

@@ -68,7 +68,6 @@ use std::vec::Drain;
 use time::Timespec;
 
 const DEFAULT_APPLY_WB_SIZE: usize = 4 * 1024;
-const WRITE_BATCH_LIMIT: usize = 16;
 const APPLY_WB_SHRINK_SIZE: usize = 1024 * 1024;
 const SHRINK_PENDING_CMD_QUEUE_CAP: usize = 64;
 
@@ -457,7 +456,7 @@ where
     /// Otherwise create `RocksWriteBatch`.
     pub fn prepare_write_batch(&mut self) {
         if self.kv_wb.is_none() {
-            let kv_wb = W::write_batch_vec(&self.engine, WRITE_BATCH_LIMIT, DEFAULT_APPLY_WB_SIZE);
+            let kv_wb = W::write_batch_vec(&self.engine, DEFAULT_APPLY_WB_SIZE);
             self.kv_wb = Some(kv_wb);
             self.kv_wb_last_bytes = 0;
             self.kv_wb_last_keys = 0;
@@ -507,8 +506,7 @@ where
             let data_size = self.kv_wb().data_size();
             if data_size > APPLY_WB_SHRINK_SIZE {
                 // Control the memory usage for the WriteBatch.
-                let kv_wb =
-                    W::write_batch_vec(&self.engine, WRITE_BATCH_LIMIT, DEFAULT_APPLY_WB_SIZE);
+                let kv_wb = W::write_batch_vec(&self.engine, DEFAULT_APPLY_WB_SIZE);
                 self.kv_wb = Some(kv_wb);
             } else {
                 // Clear data, reuse the WriteBatch, this can reduce memory allocations and deallocations.
@@ -957,9 +955,7 @@ where
         let data = entry.get_data();
 
         if !data.is_empty() {
-            let cmd = util::parse_data_at(data, index, &self.tag);
-
-            if should_write_to_engine(&cmd) || apply_ctx.kv_wb().should_write_to_engine() {
+            if apply_ctx.kv_wb().should_write_to_engine() {
                 apply_ctx.commit(self);
                 if let Some(start) = self.handle_start.as_ref() {
                     if start.elapsed() >= apply_ctx.yield_duration {
@@ -967,8 +963,17 @@ where
                     }
                 }
             }
-
-            return self.process_raft_cmd(apply_ctx, index, term, cmd);
+            match util::decode_entry_data(data, index, &self.tag) {
+                util::EntryCommand::PBRaftCmdRequest(cmd) => {
+                    if should_write_to_engine(&cmd) && !apply_ctx.kv_wb().is_empty() {
+                        apply_ctx.commit(self);
+                    }
+                    return self.process_raft_cmd(apply_ctx, index, term, cmd);
+                }
+                util::EntryCommand::RawEntryCmdRequest { epoch, data } => {
+                    self.process_raw_cmd(apply_ctx, index, term, &epoch, data);
+                }
+            }
         }
         // TOOD(cdc): should we observe empty cmd, aka leader change?
 
@@ -1064,6 +1069,43 @@ where
             }
         }
         (None, TxnExtra::default())
+    }
+
+    fn process_raw_cmd<W: WriteBatch + WriteBatchVecExt<E>>(
+        &mut self,
+        apply_ctx: &mut ApplyContext<E, W>,
+        index: u64,
+        term: u64,
+        epoch: &RegionEpoch,
+        data: &[u8],
+    ) -> ApplyResult<E::Snapshot> {
+        let include_region = epoch.get_version() >= self.last_merge_version;
+        self.apply_state.set_applied_index(index);
+        self.applied_index_term = term;
+        let mut resp = match util::compare_region_epoch(
+            epoch,
+            &self.region,
+            false, /* check_conf_ver */
+            true,  /* check_ver */
+            include_region,
+        ) {
+            Ok(()) => {
+                self.metrics.size_diff_hint += data.len() as i64;
+                apply_ctx.kv_wb_mut().append(data).unwrap_or_else(|e| {
+                    panic!(
+                        "{} failed to append data of entry (index: {}, term: {}): {:?}",
+                        self.tag, index, term, e
+                    )
+                });
+                RaftCmdResponse::default()
+            }
+            Err(e) => cmd_resp::new_error(e),
+        };
+
+        cmd_resp::bind_term(&mut resp, self.term);
+        let (cmd_cb, _) = self.find_pending(index, term, false);
+        apply_ctx.cbs.last_mut().unwrap().push(cmd_cb, resp);
+        ApplyResult::None
     }
 
     fn process_raft_cmd<W: WriteBatch + WriteBatchVecExt<E>>(

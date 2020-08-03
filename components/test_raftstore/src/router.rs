@@ -60,6 +60,14 @@ impl RaftStoreRouter<RocksEngine> for MockRaftStoreRouter {
     fn send_raft_msg(&self, _: RaftMessage) -> RaftStoreResult<()> {
         unimplemented!()
     }
+    fn send_raw_command(
+        &self,
+        _: RaftRequestHeader,
+        _: Vec<u8>,
+        _: Callback<RocksSnapshot>,
+    ) -> RaftStoreResult<()> {
+        unimplemented!()
+    }
     fn send_command(&self, _: RaftCmdRequest, _: Callback<RocksSnapshot>) -> RaftStoreResult<()> {
         unimplemented!()
     }

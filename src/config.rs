@@ -939,6 +939,7 @@ impl DbConfig {
         if self.rate_bytes_per_sec.0 > 0 {
             opts.set_ratelimiter_with_auto_tuned(
                 self.rate_bytes_per_sec.0 as i64,
+                0,
                 self.rate_limiter_mode,
                 self.auto_tuned,
             );
