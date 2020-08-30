@@ -66,7 +66,6 @@ prometheus = { version = "0.8", features = ["nightly", "push"] }
 prost = { version = "0.6", optional = true }
 protobuf = "2.8"
 quick-error = "1.2.3"
-raft = { version = "0.6.0-alpha", default-features = false }
 rand = "0.7.3"
 serde = "1.0"
 serde_derive = "1.0"
@@ -86,7 +85,6 @@ tokio-threadpool = "0.1.13"
 tokio-timer = "0.2"
 txn_types = { path = "../txn_types" }
 uuid = { version = "0.8.1", features = ["serde", "v4"] }
-raft-engine = { git = "https://github.com/tikv/raft-engine", default-features = false }
 
 [dependencies.prometheus-static-metric]
 git = "https://github.com/tikv/rust-prometheus.git"
@@ -94,6 +92,16 @@ rev = "fd122caa03de8e7e5e4fae9372583aebf19e39f6"
 
 [dependencies.yatp]
 git = "https://github.com/tikv/yatp.git"
+
+[dependencies.raft]
+git = "https://github.com/Little-Wallace/raft-rs.git"
+branch = "msg"
+default-features = false
+
+[dependencies.raft-engine]
+git = "https://github.com/Little-Wallace/raft-engine.git"
+branch = "heartbeat"
+default-features = false
 
 [dev-dependencies]
 panic_hook = { path = "../panic_hook" }

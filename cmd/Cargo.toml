@@ -72,7 +72,6 @@ pd_client = { path = "../components/pd_client" }
 prometheus = { version = "0.8", features = ["nightly", "push"] }
 promptly = "0.3.0"
 protobuf = "2.8"
-raft = { version = "0.6.0-alpha", default-features = false }
 raftstore = { path = "../components/raftstore" }
 rand = "0.7"
 security = { path = "../components/security" }
@@ -88,6 +87,11 @@ vlog = "0.1.4"
 
 [dependencies.yatp]
 git = "https://github.com/tikv/yatp.git"
+
+[dependencies.raft]
+git = "https://github.com/Little-Wallace/raft-rs.git"
+branch = "msg"
+default-features = false
 
 [target.'cfg(unix)'.dependencies]
 signal = "0.6"

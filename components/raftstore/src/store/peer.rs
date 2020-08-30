@@ -1469,6 +1469,11 @@ where
                 }
             }
         }
+        if !self.raft_group.raft.heartbeats.is_empty() {
+            let msgs = std::mem::replace(&mut self.raft_group.raft.heartbeats, vec![]);
+            ctx.need_flush_trans = true;
+            self.send(&mut ctx.trans, msgs, &mut ctx.raft_metrics.message);
+        }
 
         if !self
             .raft_group
