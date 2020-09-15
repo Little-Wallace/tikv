@@ -433,9 +433,7 @@ impl<ER: RaftEngine> TiKVServer<ER> {
         });
     }
 
-    fn init_gc_worker(
-        &mut self,
-    ) -> GcWorker<RaftKv<ServerRaftStoreRouter<RocksEngine, ER>>, RaftRouter<RocksEngine, ER>> {
+    fn init_gc_worker(&mut self) -> GcWorker<RaftRouter<RocksEngine, ER>> {
         let engines = self.engines.as_ref().unwrap();
         let engine = storage::LocalEngine::new(engines.engines.kv.clone());
         let mut gc_worker = GcWorker::new(
@@ -456,10 +454,7 @@ impl<ER: RaftEngine> TiKVServer<ER> {
 
     fn init_servers(
         &mut self,
-        gc_worker: &GcWorker<
-            RaftKv<ServerRaftStoreRouter<RocksEngine, ER>>,
-            RaftRouter<RocksEngine, ER>,
-        >,
+        gc_worker: &GcWorker<RaftRouter<RocksEngine, ER>>,
     ) -> Arc<ServerConfig> {
         let cfg_controller = self.cfg_controller.as_mut().unwrap();
         cfg_controller.register(

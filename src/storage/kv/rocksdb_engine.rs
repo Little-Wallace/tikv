@@ -10,10 +10,10 @@ use std::time::Duration;
 use engine_rocks::raw::{ColumnFamilyOptions, DBIterator, SeekKey as DBSeekKey, DB};
 use engine_rocks::raw_util::CFOptions;
 use engine_rocks::{RocksEngine as BaseRocksEngine, RocksEngineIterator};
-use engine_traits::{CfName, CF_DEFAULT, CF_LOCK, CF_RAFT, CF_WRITE, WriteBatch};
+use engine_traits::{CfName, WriteBatch, CF_DEFAULT, CF_LOCK, CF_RAFT, CF_WRITE};
 use engine_traits::{
-    Engines, IterOptions, Iterable, Iterator, KvEngine, Mutable, Peekable, ReadOptions, SeekKey,
-    WriteBatchExt, WriteOptions
+    Engines, IterOptions, Iterable, Iterator, KvEngine, Peekable, ReadOptions, SeekKey,
+    WriteBatchExt, WriteOptions,
 };
 use kvproto::kvrpcpb::Context;
 use tempfile::{Builder, TempDir};
@@ -229,7 +229,11 @@ impl TestEngineBuilder {
 }
 
 /// Write modifications into a `BaseRocksEngine` instance.
-pub fn write_modifies<W: WriteBatch<BaseRocksEngine>>(mut wb: W, kv_engine: &BaseRocksEngine, modifies: Vec<Modify>) -> Result<()> {
+pub fn write_modifies<W: WriteBatch<BaseRocksEngine>>(
+    mut wb: W,
+    kv_engine: &BaseRocksEngine,
+    modifies: Vec<Modify>,
+) -> Result<()> {
     fail_point!("rockskv_write_modifies", |_| Err(box_err!("write failed")));
 
     for rev in modifies {
@@ -274,7 +278,7 @@ pub fn write_modifies<W: WriteBatch<BaseRocksEngine>>(mut wb: W, kv_engine: &Bas
     }
     let mut opt = WriteOptions::default();
     opt.set_sync(false);
-    wb.write_to_engine(kv_engine, &opt);
+    wb.write_to_engine(kv_engine, &opt)?;
     Ok(())
 }
 

@@ -2,9 +2,9 @@
 
 mod btree_engine;
 mod cursor;
+mod local_engine;
 mod perf_context;
 mod rocksdb_engine;
-mod local_engine;
 mod stats;
 
 use std::cell::UnsafeCell;
@@ -12,9 +12,8 @@ use std::fmt;
 use std::time::Duration;
 use std::{error, ptr, result};
 
-use engine_rocks::RocksTablePropertiesCollection;
 use engine_traits::{CfName, CF_DEFAULT};
-use engine_traits::{IterOptions, KvEngine, ReadOptions};
+use engine_traits::{IterOptions, ReadOptions};
 use futures::prelude::*;
 use kvproto::errorpb::Error as ErrorHeader;
 use kvproto::kvrpcpb::{Context, ExtraOp as TxnExtraOp};
@@ -22,9 +21,9 @@ use txn_types::{Key, TxnExtra, Value};
 
 pub use self::btree_engine::{BTreeEngine, BTreeEngineIterator, BTreeEngineSnapshot};
 pub use self::cursor::{Cursor, CursorBuilder};
+pub use self::local_engine::LocalEngine;
 pub use self::perf_context::{PerfStatisticsDelta, PerfStatisticsInstant};
 pub use self::rocksdb_engine::{write_modifies, RocksEngine, RocksSnapshot, TestEngineBuilder};
-pub use self::local_engine::LocalEngine;
 pub use self::stats::{
     CfStatistics, FlowStatistics, FlowStatsReporter, Statistics, StatisticsSummary,
 };
@@ -143,36 +142,6 @@ pub trait Engine: Send + Clone + 'static {
 
     fn delete_cf(&self, ctx: &Context, cf: CfName, key: Key) -> Result<()> {
         self.write(ctx, WriteData::from_modifies(vec![Modify::Delete(cf, key)]))
-    }
-
-    fn get_properties(&self, start: &[u8], end: &[u8]) -> Result<RocksTablePropertiesCollection> {
-        self.get_properties_cf(CF_DEFAULT, start, end)
-    }
-
-    fn get_properties_cf(
-        &self,
-        _: CfName,
-        _start: &[u8],
-        _end: &[u8],
-    ) -> Result<RocksTablePropertiesCollection> {
-        Err(box_err!("no user properties"))
-    }
-
-    fn delete_files_in_range_cf(
-        &self,
-        _: CfName,
-        _start: &[u8],
-        _end: &[u8],
-    ) -> Result<()> {
-        Err(box_err!("no user delete files in range"))
-    }
-
-    fn delete_all_in_range_cf(
-        &self,
-        _: CfName,
-        _start: &[u8],
-        _end: &[u8]) -> Result<()> {
-        Err(box_err!("no user delete files in range"))
     }
 }
 

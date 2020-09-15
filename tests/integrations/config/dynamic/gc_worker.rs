@@ -8,6 +8,7 @@ use tikv::config::{ConfigController, Module, TiKvConfig};
 use tikv::server::gc_worker::GcConfig;
 use tikv::server::gc_worker::{GcTask, GcWorker};
 use tikv::storage::kv::TestEngineBuilder;
+use tikv::storage::LocalEngine;
 use tikv_util::config::ReadableSize;
 use tikv_util::time::Limiter;
 use tikv_util::worker::FutureScheduler;
@@ -22,15 +23,10 @@ fn test_gc_config_validate() {
     assert!(invalid_cfg.validate().is_err());
 }
 
-fn setup_cfg_controller(
-    cfg: TiKvConfig,
-) -> (
-    GcWorker<tikv::storage::kv::RocksEngine, RaftStoreBlackHole>,
-    ConfigController,
-) {
+fn setup_cfg_controller(cfg: TiKvConfig) -> (GcWorker<RaftStoreBlackHole>, ConfigController) {
     let engine = TestEngineBuilder::new().build().unwrap();
     let mut gc_worker = GcWorker::new(
-        engine,
+        LocalEngine::new(engine.get_rocksdb()),
         RaftStoreBlackHole,
         cfg.gc.clone(),
         Default::default(),

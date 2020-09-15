@@ -5,10 +5,10 @@ use std::io::Error as IoError;
 use std::result;
 use std::{sync::atomic::Ordering, sync::Arc, time::Duration};
 
-use engine_rocks::{RocksEngine, RocksSnapshot, RocksTablePropertiesCollection};
+use engine_rocks::{RocksEngine, RocksSnapshot};
 use engine_traits::CfName;
 use engine_traits::CF_DEFAULT;
-use engine_traits::{IterOptions, Peekable, ReadOptions, Snapshot, TablePropertiesExt};
+use engine_traits::{IterOptions, Peekable, ReadOptions, Snapshot};
 use kvproto::kvrpcpb::Context;
 use kvproto::raft_cmdpb::{
     CmdType, DeleteRangeRequest, DeleteRequest, PutRequest, RaftCmdRequest, RaftCmdResponse,
@@ -19,9 +19,8 @@ use txn_types::{Key, TxnExtraScheduler, Value};
 
 use super::metrics::*;
 use crate::storage::kv::{
-    Callback, CbContext, Cursor, Engine, Error as KvError,
-    ErrorInner as KvErrorInner, Iterator as EngineIterator, Modify, ScanMode,
-    Snapshot as EngineSnapshot, WriteData,
+    Callback, CbContext, Cursor, Engine, Error as KvError, ErrorInner as KvErrorInner,
+    Iterator as EngineIterator, Modify, ScanMode, Snapshot as EngineSnapshot, WriteData,
 };
 use crate::storage::{self, kv};
 use raftstore::errors::Error as RaftServerError;
@@ -309,6 +308,46 @@ where
         ))
     }
 
+    fn async_snapshot(
+        &self,
+        ctx: &Context,
+        read_id: Option<ThreadReadId>,
+        cb: Callback<Self::Snap>,
+    ) -> kv::Result<()> {
+        let mut req = Request::default();
+        req.set_cmd_type(CmdType::Snap);
+        ASYNC_REQUESTS_COUNTER_VEC.snapshot.all.inc();
+        let begin_instant = Instant::now_coarse();
+        self.exec_snapshot(
+            read_id,
+            ctx,
+            req,
+            Box::new(move |(cb_ctx, res)| match res {
+                Ok(CmdRes::Resp(r)) => cb((
+                    cb_ctx,
+                    Err(invalid_resp_type(CmdType::Snap, r[0].get_cmd_type()).into()),
+                )),
+                Ok(CmdRes::Snap(s)) => {
+                    ASYNC_REQUESTS_DURATIONS_VEC
+                        .snapshot
+                        .observe(begin_instant.elapsed_secs());
+                    ASYNC_REQUESTS_COUNTER_VEC.snapshot.success.inc();
+                    cb((cb_ctx, Ok(s)))
+                }
+                Err(e) => {
+                    let status_kind = get_status_kind_from_engine_error(&e);
+                    ASYNC_REQUESTS_COUNTER_VEC.snapshot.get(status_kind).inc();
+                    cb((cb_ctx, Err(e)))
+                }
+            }),
+        )
+        .map_err(|e| {
+            let status_kind = get_status_kind_from_error(&e);
+            ASYNC_REQUESTS_COUNTER_VEC.snapshot.get(status_kind).inc();
+            e.into()
+        })
+    }
+
     fn async_write(&self, ctx: &Context, batch: WriteData, cb: Callback<()>) -> kv::Result<()> {
         fail_point!("raftkv_async_write");
         if batch.modifies.is_empty() {
@@ -390,61 +429,8 @@ where
         })
     }
 
-    fn async_snapshot(
-        &self,
-        ctx: &Context,
-        read_id: Option<ThreadReadId>,
-        cb: Callback<Self::Snap>,
-    ) -> kv::Result<()> {
-        let mut req = Request::default();
-        req.set_cmd_type(CmdType::Snap);
-        ASYNC_REQUESTS_COUNTER_VEC.snapshot.all.inc();
-        let begin_instant = Instant::now_coarse();
-        self.exec_snapshot(
-            read_id,
-            ctx,
-            req,
-            Box::new(move |(cb_ctx, res)| match res {
-                Ok(CmdRes::Resp(r)) => cb((
-                    cb_ctx,
-                    Err(invalid_resp_type(CmdType::Snap, r[0].get_cmd_type()).into()),
-                )),
-                Ok(CmdRes::Snap(s)) => {
-                    ASYNC_REQUESTS_DURATIONS_VEC
-                        .snapshot
-                        .observe(begin_instant.elapsed_secs());
-                    ASYNC_REQUESTS_COUNTER_VEC.snapshot.success.inc();
-                    cb((cb_ctx, Ok(s)))
-                }
-                Err(e) => {
-                    let status_kind = get_status_kind_from_engine_error(&e);
-                    ASYNC_REQUESTS_COUNTER_VEC.snapshot.get(status_kind).inc();
-                    cb((cb_ctx, Err(e)))
-                }
-            }),
-        )
-        .map_err(|e| {
-            let status_kind = get_status_kind_from_error(&e);
-            ASYNC_REQUESTS_COUNTER_VEC.snapshot.get(status_kind).inc();
-            e.into()
-        })
-    }
-
     fn release_snapshot(&self) {
         self.router.release_snapshot_cache();
-    }
-
-    fn get_properties_cf(
-        &self,
-        cf: CfName,
-        start: &[u8],
-        end: &[u8],
-    ) -> kv::Result<RocksTablePropertiesCollection> {
-        let start = keys::data_key(start);
-        let end = keys::data_end_key(end);
-        self.engine
-            .get_range_properties_cf(cf, &start, &end)
-            .map_err(|e| e.into())
     }
 }
 

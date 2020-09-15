@@ -8,8 +8,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use concurrency_manager::ConcurrencyManager;
-use engine_rocks::RocksEngine;
-use engine_traits::{MiscExt, CF_DEFAULT, CF_LOCK, CF_WRITE};
+use engine_rocks::{RocksEngine, RocksSnapshot};
+use engine_traits::{MiscExt, TablePropertiesExt, CF_DEFAULT, CF_LOCK, CF_WRITE};
 use futures::executor::block_on;
 use kvproto::kvrpcpb::{Context, IsolationLevel, LockInfo};
 use pd_client::{ClusterVersion, PdClient};
@@ -31,6 +31,8 @@ use super::applied_lock_collector::{AppliedLockCollector, Callback as LockCollec
 use super::config::{GcConfig, GcWorkerConfigManager};
 use super::gc_manager::{AutoGcConfig, GcManager, GcManagerHandle};
 use super::{Callback, CompactionFilterInitializer, Error, ErrorInner, Result};
+use crate::storage::LocalEngine;
+use raftstore::store::RegionSnapshot;
 
 /// After the GC scan of a key, output a message to the log if there are at least this many
 /// versions of the key.
@@ -125,12 +127,11 @@ impl Display for GcTask {
 }
 
 /// Used to perform GC operations on the engine.
-struct GcRunner<E, RR>
+struct GcRunner<RR>
 where
-    E: Engine,
     RR: RaftStoreRouter<RocksEngine>,
 {
-    engine: E,
+    engine: LocalEngine,
 
     raft_store_router: RR,
 
@@ -143,13 +144,12 @@ where
     stats: Statistics,
 }
 
-impl<E, RR> GcRunner<E, RR>
+impl<RR> GcRunner<RR>
 where
-    E: Engine,
     RR: RaftStoreRouter<RocksEngine>,
 {
     pub fn new(
-        engine: E,
+        engine: LocalEngine,
         raft_store_router: RR,
         cfg_tracker: Tracker<GcConfig>,
         cfg: GcConfig,
@@ -173,10 +173,14 @@ where
     /// If this is not supported or any error happens, returns true to do further check after
     /// getting snapshot.
     fn need_gc(&self, start_key: &[u8], end_key: &[u8], safe_point: TimeStamp) -> bool {
-        let collection = match self
-            .engine
-            .get_properties_cf(CF_WRITE, &start_key, &end_key)
-        {
+        let start_data_key = keys::data_key(start_key);
+        let end_data_key = keys::data_end_key(end_key);
+
+        let collection = match self.engine.get_db().get_range_properties_cf(
+            CF_WRITE,
+            &start_data_key,
+            &end_data_key,
+        ) {
             Ok(c) => c,
             Err(_) => return true,
         };
@@ -189,7 +193,7 @@ where
         safe_point: TimeStamp,
         key: &Key,
         gc_info: &mut GcInfo,
-        txn: &mut MvccTxn<E::Snap>,
+        txn: &mut MvccTxn<RegionSnapshot<RocksSnapshot>>,
     ) -> Result<()> {
         let next_gc_info = txn.gc(key.clone(), safe_point)?;
         gc_info.found_versions += next_gc_info.found_versions;
@@ -199,7 +203,7 @@ where
         Ok(())
     }
 
-    fn new_txn(snap: E::Snap) -> MvccTxn<E::Snap> {
+    fn new_txn(snap: RegionSnapshot<RocksSnapshot>) -> MvccTxn<RegionSnapshot<RocksSnapshot>> {
         // TODO txn only used for GC, but this is hacky, maybe need an Option?
         let concurrency_manager = ConcurrencyManager::new(1.into());
         MvccTxn::for_scan(
@@ -211,7 +215,11 @@ where
         )
     }
 
-    fn flush_txn(txn: MvccTxn<E::Snap>, limiter: &Limiter, engine: &E) -> Result<()> {
+    fn flush_txn(
+        txn: MvccTxn<RegionSnapshot<RocksSnapshot>>,
+        limiter: &Limiter,
+        engine: &LocalEngine,
+    ) -> Result<()> {
         let write_size = txn.write_size();
         let modifies = txn.into_modifies();
         if !modifies.is_empty() {
@@ -307,7 +315,8 @@ where
         let delete_files_start_time = Instant::now();
         for cf in cfs {
             self.engine
-                .delete_files_in_range_cf(cf, &start_data_key, &end_data_key)
+                .get_db()
+                .delete_files_in_range_cf(cf, &start_data_key, &end_data_key, false)
                 .map_err(|e| {
                     let e: Error = box_err!(e);
                     warn!("unsafe destroy range failed at delete_files_in_range_cf"; "err" => ?e);
@@ -326,7 +335,8 @@ where
         for cf in cfs {
             // TODO: set use_delete_range with config here.
             self.engine
-                .delete_all_in_range_cf(cf, &start_data_key, &end_data_key)
+                .get_db()
+                .delete_all_in_range_cf(cf, &start_data_key, &end_data_key, false)
                 .map_err(|e| {
                     let e: Error = box_err!(e);
                     warn!("unsafe destroy range failed at delete_all_in_range_cf"; "err" => ?e);
@@ -398,9 +408,8 @@ where
     }
 }
 
-impl<E, RR> FutureRunnable<GcTask> for GcRunner<E, RR>
+impl<RR> FutureRunnable<GcTask> for GcRunner<RR>
 where
-    E: Engine,
     RR: RaftStoreRouter<RocksEngine>,
 {
     #[inline]
@@ -527,12 +536,11 @@ pub fn sync_gc(
 }
 
 /// Used to schedule GC operations.
-pub struct GcWorker<E, RR>
+pub struct GcWorker<RR>
 where
-    E: Engine,
     RR: RaftStoreRouter<RocksEngine> + 'static,
 {
-    engine: E,
+    engine: LocalEngine,
 
     /// `raft_store_router` is useful to signal raftstore clean region size informations.
     raft_store_router: RR,
@@ -554,9 +562,8 @@ where
     cluster_version: ClusterVersion,
 }
 
-impl<E, RR> Clone for GcWorker<E, RR>
+impl<RR> Clone for GcWorker<RR>
 where
-    E: Engine,
     RR: RaftStoreRouter<RocksEngine>,
 {
     #[inline]
@@ -578,9 +585,8 @@ where
     }
 }
 
-impl<E, RR> Drop for GcWorker<E, RR>
+impl<RR> Drop for GcWorker<RR>
 where
-    E: Engine,
     RR: RaftStoreRouter<RocksEngine> + 'static,
 {
     #[inline]
@@ -598,17 +604,16 @@ where
     }
 }
 
-impl<E, RR> GcWorker<E, RR>
+impl<RR> GcWorker<RR>
 where
-    E: Engine,
     RR: RaftStoreRouter<RocksEngine>,
 {
     pub fn new(
-        engine: E,
+        engine: LocalEngine,
         raft_store_router: RR,
         cfg: GcConfig,
         cluster_version: ClusterVersion,
-    ) -> GcWorker<E, RR> {
+    ) -> GcWorker<RR> {
         let worker = Arc::new(Mutex::new(FutureWorker::new("gc-worker")));
         let worker_scheduler = worker.lock().unwrap().scheduler();
         GcWorker {
@@ -631,10 +636,11 @@ where
     ) -> Result<()> {
         let safe_point = Arc::new(AtomicU64::new(0));
 
-        let kvdb = self.engine.kv_engine();
         let cfg_mgr = self.config_manager.clone();
         let cluster_version = self.cluster_version.clone();
-        kvdb.init_compaction_filter(safe_point.clone(), cfg_mgr, cluster_version);
+        self.engine
+            .get_db()
+            .init_compaction_filter(safe_point.clone(), cfg_mgr, cluster_version);
 
         let mut handle = self.gc_manager_handle.lock().unwrap();
         assert!(handle.is_none());
@@ -827,8 +833,8 @@ mod tests {
     use txn_types::Mutation;
 
     use crate::storage::kv::{
-        self, Callback as EngineCallback, Modify, Result as EngineResult,
-        TestEngineBuilder, WriteData,
+        self, Callback as EngineCallback, Modify, Result as EngineResult, TestEngineBuilder,
+        WriteData,
     };
     use crate::storage::lock_manager::DummyLockManager;
     use crate::storage::{txn::commands, Engine, Storage, TestStorageBuilder};
@@ -847,11 +853,7 @@ mod tests {
         // Use RegionSnapshot which can remove the z prefix internally.
         type Snap = RegionSnapshot<RocksSnapshot>;
 
-        fn local_snapshot(
-            &self,
-            start_key: &[u8],
-            end_key: &[u8],
-        ) -> kv::Result<Self::Snap> {
+        fn local_snapshot(&self, start_key: &[u8], end_key: &[u8]) -> kv::Result<Self::Snap> {
             let mut region = metapb::Region::default();
             region.set_start_key(start_key.to_owned());
             region.set_end_key(end_key.to_owned());
@@ -948,8 +950,9 @@ mod tests {
             TestStorageBuilder::from_engine_and_lock_mgr(engine.clone(), DummyLockManager {})
                 .build()
                 .unwrap();
+        let local_engine = LocalEngine::new(engine.get_rocksdb());
         let mut gc_worker = GcWorker::new(
-            engine,
+            local_engine,
             RaftStoreBlackHole,
             GcConfig::default(),
             ClusterVersion::new(semver::Version::new(5, 0, 0)),
