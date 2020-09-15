@@ -10,10 +10,10 @@ use std::time::Duration;
 use engine_rocks::raw::{ColumnFamilyOptions, DBIterator, SeekKey as DBSeekKey, DB};
 use engine_rocks::raw_util::CFOptions;
 use engine_rocks::{RocksEngine as BaseRocksEngine, RocksEngineIterator};
-use engine_traits::{CfName, CF_DEFAULT, CF_LOCK, CF_RAFT, CF_WRITE};
+use engine_traits::{CfName, CF_DEFAULT, CF_LOCK, CF_RAFT, CF_WRITE, WriteBatch};
 use engine_traits::{
     Engines, IterOptions, Iterable, Iterator, KvEngine, Mutable, Peekable, ReadOptions, SeekKey,
-    WriteBatchExt,
+    WriteBatchExt, WriteOptions
 };
 use kvproto::kvrpcpb::Context;
 use tempfile::{Builder, TempDir};
@@ -57,7 +57,8 @@ impl Runnable for Runner {
     fn run(&mut self, t: Task) {
         match t {
             Task::Write(modifies, cb) => {
-                cb((CbContext::new(), write_modifies(&self.0.kv, modifies)))
+                let wb = self.0.kv.write_batch();
+                cb((CbContext::new(), write_modifies(wb, &self.0.kv, modifies)))
             }
             Task::Snapshot(cb) => cb((CbContext::new(), Ok(Arc::new(self.0.kv.snapshot())))),
             Task::Pause(dur) => std::thread::sleep(dur),
@@ -228,10 +229,9 @@ impl TestEngineBuilder {
 }
 
 /// Write modifications into a `BaseRocksEngine` instance.
-pub fn write_modifies(kv_engine: &BaseRocksEngine, modifies: Vec<Modify>) -> Result<()> {
+pub fn write_modifies<W: WriteBatch<BaseRocksEngine>>(mut wb: W, kv_engine: &BaseRocksEngine, modifies: Vec<Modify>) -> Result<()> {
     fail_point!("rockskv_write_modifies", |_| Err(box_err!("write failed")));
 
-    let mut wb = kv_engine.write_batch();
     for rev in modifies {
         let res = match rev {
             Modify::Delete(cf, k) => {
@@ -272,24 +272,17 @@ pub fn write_modifies(kv_engine: &BaseRocksEngine, modifies: Vec<Modify>) -> Res
             return Err(box_err!("{}", msg));
         }
     }
-    kv_engine.write(&wb)?;
+    let mut opt = WriteOptions::default();
+    opt.set_sync(false);
+    wb.write_to_engine(kv_engine, &opt);
     Ok(())
 }
 
 impl Engine for RocksEngine {
     type Snap = Arc<RocksSnapshot>;
-    type Local = BaseRocksEngine;
 
-    fn kv_engine(&self) -> BaseRocksEngine {
-        self.engines.kv.clone()
-    }
-
-    fn snapshot_on_kv_engine(&self, _: &[u8], _: &[u8]) -> Result<Self::Snap> {
+    fn local_snapshot(&self, _: &[u8], _: &[u8]) -> Result<Self::Snap> {
         self.snapshot(&Context::default())
-    }
-
-    fn modify_on_kv_engine(&self, modifies: Vec<Modify>) -> Result<()> {
-        write_modifies(&self.engines.kv, modifies)
     }
 
     fn async_write(&self, _: &Context, batch: WriteData, cb: Callback<()>) -> Result<()> {

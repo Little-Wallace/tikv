@@ -4,6 +4,7 @@ mod btree_engine;
 mod cursor;
 mod perf_context;
 mod rocksdb_engine;
+mod local_engine;
 mod stats;
 
 use std::cell::UnsafeCell;
@@ -13,7 +14,7 @@ use std::{error, ptr, result};
 
 use engine_rocks::RocksTablePropertiesCollection;
 use engine_traits::{CfName, CF_DEFAULT};
-use engine_traits::{IterOptions, KvEngine as LocalEngine, ReadOptions};
+use engine_traits::{IterOptions, KvEngine, ReadOptions};
 use futures::prelude::*;
 use kvproto::errorpb::Error as ErrorHeader;
 use kvproto::kvrpcpb::{Context, ExtraOp as TxnExtraOp};
@@ -23,6 +24,7 @@ pub use self::btree_engine::{BTreeEngine, BTreeEngineIterator, BTreeEngineSnapsh
 pub use self::cursor::{Cursor, CursorBuilder};
 pub use self::perf_context::{PerfStatisticsDelta, PerfStatisticsInstant};
 pub use self::rocksdb_engine::{write_modifies, RocksEngine, RocksSnapshot, TestEngineBuilder};
+pub use self::local_engine::LocalEngine;
 pub use self::stats::{
     CfStatistics, FlowStatistics, FlowStatsReporter, Statistics, StatisticsSummary,
 };
@@ -94,15 +96,8 @@ impl WriteData {
 
 pub trait Engine: Send + Clone + 'static {
     type Snap: Snapshot;
-    type Local: LocalEngine;
 
-    /// Local storage engine.
-    fn kv_engine(&self) -> Self::Local;
-
-    fn snapshot_on_kv_engine(&self, start_key: &[u8], end_key: &[u8]) -> Result<Self::Snap>;
-
-    /// Write modifications into internal local engine directly.
-    fn modify_on_kv_engine(&self, modifies: Vec<Modify>) -> Result<()>;
+    fn local_snapshot(&self, start_key: &[u8], end_key: &[u8]) -> Result<Self::Snap>;
 
     fn async_snapshot(
         &self,
@@ -161,6 +156,23 @@ pub trait Engine: Send + Clone + 'static {
         _end: &[u8],
     ) -> Result<RocksTablePropertiesCollection> {
         Err(box_err!("no user properties"))
+    }
+
+    fn delete_files_in_range_cf(
+        &self,
+        _: CfName,
+        _start: &[u8],
+        _end: &[u8],
+    ) -> Result<()> {
+        Err(box_err!("no user delete files in range"))
+    }
+
+    fn delete_all_in_range_cf(
+        &self,
+        _: CfName,
+        _start: &[u8],
+        _end: &[u8]) -> Result<()> {
+        Err(box_err!("no user delete files in range"))
     }
 }
 

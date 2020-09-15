@@ -437,8 +437,9 @@ impl<ER: RaftEngine> TiKVServer<ER> {
         &mut self,
     ) -> GcWorker<RaftKv<ServerRaftStoreRouter<RocksEngine, ER>>, RaftRouter<RocksEngine, ER>> {
         let engines = self.engines.as_ref().unwrap();
+        let engine = storage::LocalEngine::new(engines.engines.kv.clone());
         let mut gc_worker = GcWorker::new(
-            engines.engine.clone(),
+            engine,
             self.router.clone(),
             self.config.gc.clone(),
             self.pd_client.cluster_version(),

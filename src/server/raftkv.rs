@@ -19,7 +19,7 @@ use txn_types::{Key, TxnExtraScheduler, Value};
 
 use super::metrics::*;
 use crate::storage::kv::{
-    write_modifies, Callback, CbContext, Cursor, Engine, Error as KvError,
+    Callback, CbContext, Cursor, Engine, Error as KvError,
     ErrorInner as KvErrorInner, Iterator as EngineIterator, Modify, ScanMode,
     Snapshot as EngineSnapshot, WriteData,
 };
@@ -296,13 +296,8 @@ where
     S: RaftStoreRouter<RocksEngine> + LocalReadRouter<RocksEngine> + 'static,
 {
     type Snap = RegionSnapshot<RocksSnapshot>;
-    type Local = RocksEngine;
 
-    fn kv_engine(&self) -> RocksEngine {
-        self.engine.clone()
-    }
-
-    fn snapshot_on_kv_engine(&self, start_key: &[u8], end_key: &[u8]) -> kv::Result<Self::Snap> {
+    fn local_snapshot(&self, start_key: &[u8], end_key: &[u8]) -> kv::Result<Self::Snap> {
         let mut region = metapb::Region::default();
         region.set_start_key(start_key.to_owned());
         region.set_end_key(end_key.to_owned());
@@ -312,28 +307,6 @@ where
             self.engine.clone(),
             region,
         ))
-    }
-
-    fn modify_on_kv_engine(&self, mut modifies: Vec<Modify>) -> kv::Result<()> {
-        for modify in &mut modifies {
-            match modify {
-                Modify::Delete(_, ref mut key) => {
-                    let bytes = keys::data_key(key.as_encoded());
-                    *key = Key::from_encoded(bytes);
-                }
-                Modify::Put(_, ref mut key, _) => {
-                    let bytes = keys::data_key(key.as_encoded());
-                    *key = Key::from_encoded(bytes);
-                }
-                Modify::DeleteRange(_, ref mut key1, ref mut key2, _) => {
-                    let bytes = keys::data_key(key1.as_encoded());
-                    *key1 = Key::from_encoded(bytes);
-                    let bytes = keys::data_end_key(key2.as_encoded());
-                    *key2 = Key::from_encoded(bytes);
-                }
-            }
-        }
-        write_modifies(&self.engine, modifies)
     }
 
     fn async_write(&self, ctx: &Context, batch: WriteData, cb: Callback<()>) -> kv::Result<()> {

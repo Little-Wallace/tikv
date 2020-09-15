@@ -24,7 +24,7 @@ use tikv_util::worker::{
 use txn_types::{Key, TimeStamp};
 
 use crate::server::metrics::*;
-use crate::storage::kv::{Engine, ScanMode, Statistics};
+use crate::storage::kv::{Engine, ScanMode, Statistics, WriteData};
 use crate::storage::mvcc::{check_need_gc, Error as MvccError, GcInfo, MvccReader, MvccTxn};
 
 use super::applied_lock_collector::{AppliedLockCollector, Callback as LockCollectorCallback};
@@ -216,7 +216,7 @@ where
         let modifies = txn.into_modifies();
         if !modifies.is_empty() {
             limiter.blocking_consume(write_size);
-            engine.modify_on_kv_engine(modifies)?;
+            engine.write(&Context::default(), WriteData::from_modifies(modifies))?;
         }
         Ok(())
     }
@@ -228,7 +228,7 @@ where
         }
 
         let mut reader = MvccReader::new(
-            self.engine.snapshot_on_kv_engine(start_key, end_key)?,
+            self.engine.local_snapshot(start_key, end_key)?,
             Some(ScanMode::Forward),
             false,
             IsolationLevel::Si,
@@ -246,7 +246,7 @@ where
             }
 
             let mut keys = keys.into_iter();
-            let mut txn = Self::new_txn(self.engine.snapshot_on_kv_engine(start_key, end_key)?);
+            let mut txn = Self::new_txn(self.engine.local_snapshot(start_key, end_key)?);
             let (mut next_gc_key, mut gc_info) = (keys.next(), GcInfo::default());
             while let Some(ref key) = next_gc_key {
                 if let Err(e) = self.gc_key(safe_point, key, &mut gc_info, &mut txn) {
@@ -273,7 +273,7 @@ where
                     gc_info = GcInfo::default();
                 } else {
                     Self::flush_txn(txn, &self.limiter, &self.engine)?;
-                    txn = Self::new_txn(self.engine.snapshot_on_kv_engine(start_key, end_key)?);
+                    txn = Self::new_txn(self.engine.local_snapshot(start_key, end_key)?);
                 }
             }
             Self::flush_txn(txn, &self.limiter, &self.engine)?;
@@ -295,8 +295,6 @@ where
             "start_key" => %start_key, "end_key" => %end_key
         );
 
-        let local_storage = self.engine.kv_engine();
-
         // Convert keys to RocksDB layer form
         // TODO: Logic coupled with raftstore's implementation. Maybe better design is to do it in
         // somewhere of the same layer with apply_worker.
@@ -308,8 +306,8 @@ where
         // First, call delete_files_in_range to free as much disk space as possible
         let delete_files_start_time = Instant::now();
         for cf in cfs {
-            local_storage
-                .delete_files_in_range_cf(cf, &start_data_key, &end_data_key, false)
+            self.engine
+                .delete_files_in_range_cf(cf, &start_data_key, &end_data_key)
                 .map_err(|e| {
                     let e: Error = box_err!(e);
                     warn!("unsafe destroy range failed at delete_files_in_range_cf"; "err" => ?e);
@@ -327,8 +325,8 @@ where
         let cleanup_all_start_time = Instant::now();
         for cf in cfs {
             // TODO: set use_delete_range with config here.
-            local_storage
-                .delete_all_in_range_cf(cf, &start_data_key, &end_data_key, false)
+            self.engine
+                .delete_all_in_range_cf(cf, &start_data_key, &end_data_key)
                 .map_err(|e| {
                     let e: Error = box_err!(e);
                     warn!("unsafe destroy range failed at delete_all_in_range_cf"; "err" => ?e);
@@ -364,7 +362,7 @@ where
     ) -> Result<Vec<LockInfo>> {
         let snap = self
             .engine
-            .snapshot_on_kv_engine(start_key.as_encoded(), &[])
+            .local_snapshot(start_key.as_encoded(), &[])
             .unwrap();
         let mut reader = MvccReader::new(snap, Some(ScanMode::Forward), false, IsolationLevel::Si);
         let (locks, _) = reader.scan_locks(Some(start_key), |l| l.ts <= max_ts, limit)?;
@@ -829,7 +827,7 @@ mod tests {
     use txn_types::Mutation;
 
     use crate::storage::kv::{
-        self, write_modifies, Callback as EngineCallback, Modify, Result as EngineResult,
+        self, Callback as EngineCallback, Modify, Result as EngineResult,
         TestEngineBuilder, WriteData,
     };
     use crate::storage::lock_manager::DummyLockManager;
@@ -848,13 +846,8 @@ mod tests {
     impl Engine for PrefixedEngine {
         // Use RegionSnapshot which can remove the z prefix internally.
         type Snap = RegionSnapshot<RocksSnapshot>;
-        type Local = RocksEngine;
 
-        fn kv_engine(&self) -> RocksEngine {
-            self.0.kv_engine()
-        }
-
-        fn snapshot_on_kv_engine(
+        fn local_snapshot(
             &self,
             start_key: &[u8],
             end_key: &[u8],
@@ -868,28 +861,6 @@ mod tests {
                 Arc::new(self.kv_engine().snapshot()),
                 Arc::new(region),
             ))
-        }
-
-        fn modify_on_kv_engine(&self, mut modifies: Vec<Modify>) -> kv::Result<()> {
-            for modify in &mut modifies {
-                match modify {
-                    Modify::Delete(_, ref mut key) => {
-                        let bytes = keys::data_key(key.as_encoded());
-                        *key = Key::from_encoded(bytes);
-                    }
-                    Modify::Put(_, ref mut key, _) => {
-                        let bytes = keys::data_key(key.as_encoded());
-                        *key = Key::from_encoded(bytes);
-                    }
-                    Modify::DeleteRange(_, ref mut key1, ref mut key2, _) => {
-                        let bytes = keys::data_key(key1.as_encoded());
-                        *key1 = Key::from_encoded(bytes);
-                        let bytes = keys::data_end_key(key2.as_encoded());
-                        *key2 = Key::from_encoded(bytes);
-                    }
-                }
-            }
-            write_modifies(&self.kv_engine(), modifies)
         }
 
         fn async_write(

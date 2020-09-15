@@ -71,17 +71,8 @@ impl Default for BTreeEngine {
 
 impl Engine for BTreeEngine {
     type Snap = BTreeEngineSnapshot;
-    type Local = RocksEngine;
 
-    fn kv_engine(&self) -> RocksEngine {
-        unimplemented!();
-    }
-
-    fn snapshot_on_kv_engine(&self, _: &[u8], _: &[u8]) -> EngineResult<Self::Snap> {
-        unimplemented!();
-    }
-
-    fn modify_on_kv_engine(&self, _: Vec<Modify>) -> EngineResult<()> {
+    fn local_snapshot(&self, _: &[u8], _: &[u8]) -> EngineResult<Self::Snap> {
         unimplemented!();
     }
 
