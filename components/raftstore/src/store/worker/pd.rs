@@ -1070,7 +1070,7 @@ where
                 approximate_keys,
                 replication_status,
             } => {
-                let timer = CHECK_SPILT_HISTOGRAM.start_coarse_timer();
+                let timer = PD_HEARTBEAT_HISTOGRAM.start_coarse_timer();
                 let approximate_size = approximate_size.unwrap_or_else(|| {
                     get_region_approximate_size(&self.db, &region, 0).unwrap_or_default()
                 });
