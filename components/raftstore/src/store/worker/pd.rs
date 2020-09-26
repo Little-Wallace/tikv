@@ -29,6 +29,7 @@ use crate::store::util::is_epoch_stale;
 use crate::store::util::KeysInfoFormatter;
 use crate::store::worker::split_controller::{SplitInfo, TOP_N};
 use crate::store::worker::{AutoSplitController, ReadStats};
+use crate::store::worker::metrics::*;
 use crate::store::Callback;
 use crate::store::StoreInfo;
 use crate::store::{CasualMessage, PeerMsg, RaftCommand, RaftRouter, StoreMsg};
@@ -40,6 +41,7 @@ use tikv_util::collections::HashMap;
 use tikv_util::metrics::ThreadInfoStatistics;
 use tikv_util::time::UnixSecs;
 use tikv_util::worker::{FutureRunnable as Runnable, FutureScheduler as Scheduler, Stopped};
+use tikv_util::future::poll_future_notify;
 
 type RecordPairVec = Vec<pdpb::RecordPair>;
 
@@ -630,17 +632,18 @@ where
             .region_keys_read
             .observe(region_stat.read_keys as f64);
 
-        let f = self
-            .pd_client
-            .region_heartbeat(term, region.clone(), peer, region_stat, replication_status)
-            .map_err(move |e| {
+        let ret = self.pd_client
+            .region_heartbeat(term, region.clone(), peer, region_stat, replication_status);
+        let f = async move {
+            if let Err(e) = ret.await {
                 debug!(
                     "failed to send heartbeat";
                     "region_id" => region.get_id(),
                     "err" => ?e
-                );
-            });
-        spawn_local(f);
+                    );
+            }
+        };
+        poll_future_notify(f);
     }
 
     fn handle_store_heartbeat(&mut self, mut stats: pdpb::StoreStats, store_info: StoreInfo<EK>) {
@@ -1062,6 +1065,7 @@ where
                 approximate_keys,
                 replication_status,
             } => {
+                let timer = CHECK_SPILT_HISTOGRAM.start_coarse_timer();
                 let approximate_size = approximate_size.unwrap_or_else(|| {
                     get_region_approximate_size(&self.db, &region, 0).unwrap_or_default()
                 });
@@ -1116,7 +1120,8 @@ where
                         last_report_ts,
                     },
                     replication_status,
-                )
+                );
+                timer.observe_duration();
             }
             Task::StoreHeartbeat { stats, store_info } => {
                 self.handle_store_heartbeat(stats, store_info)
