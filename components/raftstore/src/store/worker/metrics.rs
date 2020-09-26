@@ -115,11 +115,9 @@ lazy_static! {
         "Total number of requests directly executed by local reader."
     )
     .unwrap();
-
     pub static ref PD_HEARTBEAT_HISTOGRAM: Histogram = register_histogram!(
         "tikv_pd_heartbeat_handle_duration",
         "Bucket histogram of handle pd heartbeat duration"
     )
     .unwrap();
-
 }

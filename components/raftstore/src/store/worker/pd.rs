@@ -27,9 +27,9 @@ use crate::store::cmd_resp::new_error;
 use crate::store::metrics::*;
 use crate::store::util::is_epoch_stale;
 use crate::store::util::KeysInfoFormatter;
+use crate::store::worker::metrics::*;
 use crate::store::worker::split_controller::{SplitInfo, TOP_N};
 use crate::store::worker::{AutoSplitController, ReadStats};
-use crate::store::worker::metrics::*;
 use crate::store::Callback;
 use crate::store::StoreInfo;
 use crate::store::{CasualMessage, PeerMsg, RaftCommand, RaftRouter, StoreMsg};
@@ -38,10 +38,10 @@ use concurrency_manager::ConcurrencyManager;
 use pd_client::metrics::*;
 use pd_client::{Error, PdClient, RegionStat};
 use tikv_util::collections::HashMap;
+use tikv_util::future::poll_future_notify;
 use tikv_util::metrics::ThreadInfoStatistics;
 use tikv_util::time::UnixSecs;
 use tikv_util::worker::{FutureRunnable as Runnable, FutureScheduler as Scheduler, Stopped};
-use tikv_util::future::poll_future_notify;
 
 type RecordPairVec = Vec<pdpb::RecordPair>;
 
@@ -632,15 +632,20 @@ where
             .region_keys_read
             .observe(region_stat.read_keys as f64);
 
-        let ret = self.pd_client
-            .region_heartbeat(term, region.clone(), peer, region_stat, replication_status);
+        let ret = self.pd_client.region_heartbeat(
+            term,
+            region.clone(),
+            peer,
+            region_stat,
+            replication_status,
+        );
         let f = async move {
             if let Err(e) = ret.await {
                 debug!(
-                    "failed to send heartbeat";
-                    "region_id" => region.get_id(),
-                    "err" => ?e
-                    );
+                "failed to send heartbeat";
+                "region_id" => region.get_id(),
+                "err" => ?e
+                );
             }
         };
         poll_future_notify(f);
@@ -728,7 +733,7 @@ where
                 }
             }
         };
-        spawn_local(f);
+        poll_future_notify(f);
     }
 
     fn handle_report_batch_split(&self, regions: Vec<metapb::Region>) {
