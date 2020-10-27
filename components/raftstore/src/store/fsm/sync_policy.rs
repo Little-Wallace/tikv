@@ -99,18 +99,21 @@ impl<EK: KvEngine, ER: RaftEngine> SyncPolicy<EK, ER> {
     }
 
     /// Check if this thread should call sync or not.
-    pub fn check_sync(&mut self, before_sync_ts: i64) -> bool {
-        if !self.delay_sync_enabled {
-            return true;
-        }
-
+    pub fn maybe_sync(&mut self) -> bool {
+        let before_sync_ts = TiInstant::now_coarse().to_microsec();
         self.try_flush_regions();
-
-        self.check_sync_internal(before_sync_ts)
+        let need_sync = self.delay_sync_enabled && self.check_sync_internal(before_sync_ts);
+        if need_sync {
+            self.raft_engine.sync().unwrap_or_else(|e| {
+                panic!("failed to sync raft engine: {:?}", e);
+            });
+        }
+        self.post_sync_time_point(before_sync_ts, need_sync);
+        need_sync
     }
 
     /// Update metrics and status after the sync time point (whether did sync or not)
-    pub fn post_sync_time_point(&mut self, before_sync_ts: i64, did_sync: bool) {
+    fn post_sync_time_point(&mut self, before_sync_ts: i64, did_sync: bool) {
         if did_sync {
             self.metrics.sync_events.sync_raftdb_count += 1;
         } else {

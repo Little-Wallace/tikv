@@ -682,18 +682,7 @@ impl<EK: KvEngine, ER: RaftEngine, T: Transport, C: PdClient> RaftPoller<EK, ER,
                     panic!("{} failed to save raft append result: {:?}", self.tag, e);
                 });
         }
-
-        let before_sync_ts = TiInstant::now_coarse().to_microsec();
-        let need_sync = self.poll_ctx.sync_policy.check_sync(before_sync_ts);
-        if need_sync {
-            self.poll_ctx.engines.raft.sync().unwrap_or_else(|e| {
-                panic!("{} failed to sync raft engine: {:?}", self.tag, e);
-            });
-        }
-
-        self.poll_ctx
-            .sync_policy
-            .post_sync_time_point(before_sync_ts, need_sync);
+        let need_sync = self.poll_ctx.sync_policy.maybe_sync();
 
         report_perf_context!(
             self.poll_ctx.perf_context_statistics,
