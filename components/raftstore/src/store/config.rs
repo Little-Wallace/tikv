@@ -29,6 +29,8 @@ with_prefix!(prefix_store "store-");
 pub struct Config {
     // delay microsecond of raft db sync, 0 means no delay.
     pub delay_sync_us: u64,
+    // enable one independent thread to sync wal of raftdb.
+    pub enable_async_io: bool,
     // minimizes disruption when a partitioned node rejoins the cluster by using a two phase election.
     #[config(skip)]
     pub prevote: bool,
@@ -195,6 +197,7 @@ impl Default for Config {
         let split_size = ReadableSize::mb(coprocessor::config::SPLIT_SIZE_MB);
         Config {
             delay_sync_us: 0,
+            enable_async_io: false,
             prevote: true,
             raftdb_path: String::new(),
             capacity: ReadableSize(0),

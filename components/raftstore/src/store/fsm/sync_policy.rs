@@ -2,12 +2,13 @@
 
 use std::collections::BTreeSet;
 use std::sync::atomic::Ordering;
-use std::sync::atomic::{AtomicI64, AtomicU64};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64};
+use std::sync::{Arc, Condvar, Mutex};
 
 use engine_traits::KvEngine;
 use engine_traits::RaftEngine;
 
+use std::thread::{Builder, JoinHandle};
 use tikv_util::collections::HashMap;
 use tikv_util::time::Instant as TiInstant;
 
@@ -17,6 +18,80 @@ use crate::store::PeerMsg;
 
 const UNSYNCED_REGIONS_SIZE_LIMIT: usize = 512;
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum SyncMode {
+    SyncIO,
+    AsyncIO,
+    DelaySyncIO,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum SyncState {
+    Wait,
+    Run,
+    Stop,
+}
+
+#[derive(Clone)]
+pub struct Notifier {
+    cond: Arc<Condvar>,
+    state: Arc<Mutex<SyncState>>,
+    run: Arc<AtomicBool>,
+}
+
+impl Notifier {
+    pub fn new() -> Notifier {
+        Notifier {
+            cond: Arc::new(Condvar::new()),
+            state: Arc::new(Mutex::new(SyncState::Run)),
+            run: Arc::new(AtomicBool::new(true)),
+        }
+    }
+
+    /// Return whether this thread need to stop
+    pub fn wait<F>(&self, mut f: F) -> bool
+    where
+        F: FnMut() -> bool,
+    {
+        let mut state = self.state.lock().unwrap();
+        self.run.store(false, Ordering::Release);
+        *state = SyncState::Wait;
+
+        // The condiction `f` must be changed before calling `maybe_notify` so that this thread
+        // would not sleep when there is still some messages to deal with.
+        while *state == SyncState::Wait && !f() {
+            state = self.cond.wait(state).unwrap();
+        }
+        if *state == SyncState::Wait {
+            *state = SyncState::Run;
+            self.run.store(true, Ordering::Release);
+            return true;
+        } else {
+            return false;
+        }
+    }
+
+    pub fn maybe_notify(&self) {
+        // Use atomic flag to avoid acquire lock.
+        if !self.run.load(Ordering::Acquire) {
+            let state = self.state.lock().unwrap();
+            if *state == SyncState::Wait {
+                self.cond.notify_one();
+            }
+        }
+    }
+
+    pub fn stop(&self) {
+        let mut state = self.state.lock().unwrap();
+        if *state == SyncState::Wait {
+            *state = SyncState::Stop;
+            self.cond.notify_one();
+        } else {
+            *state = SyncState::Stop;
+        }
+    }
+}
+
 /// This class is for control the raft-engine wal 'sync' policy.
 /// When regions received data, the 'sync' will be holded until reach
 /// the deadline. After that, when 'sync' is called by any thread later,
@@ -25,7 +100,7 @@ pub struct SyncPolicy<EK: KvEngine, ER: RaftEngine> {
     pub metrics: SyncEventMetrics,
     raft_engine: ER,
     router: RaftRouter<EK, ER>,
-    delay_sync_enabled: bool,
+    sync_mode: SyncMode,
     delay_sync_us: i64,
 
     /// The global-variables are for cooperate with other poll-worker threads.
@@ -41,6 +116,8 @@ pub struct SyncPolicy<EK: KvEngine, ER: RaftEngine> {
     /// Used for quickly checking if timestamp reaches deadline.
     /// The set contains: <(create_time, region_id)>
     unsynced_regions_set: BTreeSet<(i64, u64)>,
+
+    notifier: Notifier,
 }
 
 impl<EK: KvEngine, ER: RaftEngine> SyncPolicy<EK, ER> {
@@ -48,20 +125,29 @@ impl<EK: KvEngine, ER: RaftEngine> SyncPolicy<EK, ER> {
         raft_engine: ER,
         router: RaftRouter<EK, ER>,
         delay_sync_enabled: bool,
+        enable_sync_io: bool,
         delay_sync_us: i64,
     ) -> SyncPolicy<EK, ER> {
         let current_ts = TiInstant::now_coarse().to_microsec();
+        let sync_mode = if enable_sync_io {
+            SyncMode::AsyncIO
+        } else if delay_sync_enabled {
+            SyncMode::DelaySyncIO
+        } else {
+            SyncMode::SyncIO
+        };
         SyncPolicy {
             metrics: SyncEventMetrics::default(),
             raft_engine,
             router,
+            sync_mode,
             delay_sync_us,
             global_plan_sync_ts: Arc::new(AtomicI64::new(current_ts)),
             global_last_sync_ts: Arc::new(AtomicI64::new(current_ts)),
-            delay_sync_enabled,
             local_last_sync_ts: current_ts,
             unsynced_regions_map: HashMap::default(),
             unsynced_regions_set: BTreeSet::default(),
+            notifier: Notifier::new(),
         }
     }
 
@@ -70,13 +156,14 @@ impl<EK: KvEngine, ER: RaftEngine> SyncPolicy<EK, ER> {
             metrics: SyncEventMetrics::default(),
             raft_engine: self.raft_engine.clone(),
             router: self.router.clone(),
-            delay_sync_enabled: self.delay_sync_enabled,
+            sync_mode: self.sync_mode,
             delay_sync_us: self.delay_sync_us,
             global_plan_sync_ts: self.global_plan_sync_ts.clone(),
             global_last_sync_ts: self.global_last_sync_ts.clone(),
             local_last_sync_ts: self.global_last_sync_ts.load(Ordering::Relaxed),
             unsynced_regions_map: HashMap::default(),
             unsynced_regions_set: BTreeSet::default(),
+            notifier: self.notifier.clone(),
         }
     }
 
@@ -86,7 +173,7 @@ impl<EK: KvEngine, ER: RaftEngine> SyncPolicy<EK, ER> {
 
     /// Return if all unsynced regions are flushed
     pub fn try_flush_regions(&mut self) -> bool {
-        if !self.delay_sync_enabled || self.unsynced_regions_map.is_empty() {
+        if self.unsynced_regions_map.is_empty() {
             return true;
         }
         let last_sync_ts = self.global_last_sync_ts.load(Ordering::Acquire);
@@ -102,26 +189,53 @@ impl<EK: KvEngine, ER: RaftEngine> SyncPolicy<EK, ER> {
     pub fn maybe_sync(&mut self) -> bool {
         let before_sync_ts = TiInstant::now_coarse().to_microsec();
         self.try_flush_regions();
-        let need_sync = self.delay_sync_enabled && self.check_sync_internal(before_sync_ts);
-        if need_sync {
-            self.raft_engine.sync().unwrap_or_else(|e| {
-                panic!("failed to sync raft engine: {:?}", e);
-            });
+        match self.sync_mode {
+            SyncMode::DelaySyncIO => {
+                let sync = self.check_sync_internal(before_sync_ts);
+                if sync {
+                    self.raft_engine.sync().unwrap_or_else(|e| {
+                        panic!("failed to sync raft engine: {:?}", e);
+                    });
+                    self.metrics.sync_events.sync_raftdb_count += 1;
+                    self.post_sync_time_point(before_sync_ts);
+                } else {
+                    self.metrics.sync_events.raftdb_skipped_sync_count += 1;
+                }
+                sync
+            }
+            SyncMode::SyncIO => {
+                self.raft_engine.sync().unwrap_or_else(|e| {
+                    panic!("failed to sync raft engine: {:?}", e);
+                });
+                true
+            }
+            SyncMode::AsyncIO => {
+                let mut plan_sync_ts = self.global_plan_sync_ts.load(Ordering::Acquire);
+                while plan_sync_ts < before_sync_ts {
+                    // We will refresh the plan sync ts to notify sync-thread. If `global_plan_sync_ts`
+                    //  has been refreshed by other thread we must make sure that it is greater
+                    // than time of current thread, or it may make sync-thread change `global_last_sync_ts`
+                    // to a smaller value and ready of current thread will never be flushed if there is no
+                    // write request any more.
+                    let old_ts = self.global_plan_sync_ts.compare_and_swap(
+                        plan_sync_ts,
+                        before_sync_ts,
+                        Ordering::SeqCst,
+                    );
+                    if plan_sync_ts == old_ts {
+                        self.notifier.maybe_notify();
+                        break;
+                    } else {
+                        plan_sync_ts = old_ts;
+                    }
+                }
+                false
+            }
         }
-        self.post_sync_time_point(before_sync_ts, need_sync);
-        need_sync
     }
 
     /// Update metrics and status after the sync time point (whether did sync or not)
-    fn post_sync_time_point(&mut self, before_sync_ts: i64, did_sync: bool) {
-        if did_sync {
-            self.metrics.sync_events.sync_raftdb_count += 1;
-        } else {
-            self.metrics.sync_events.raftdb_skipped_sync_count += 1;
-        }
-        if !self.delay_sync_enabled || !did_sync {
-            return;
-        }
+    fn post_sync_time_point(&mut self, before_sync_ts: i64) {
         self.update_status_after_synced(before_sync_ts);
         self.flush_unsynced_regions(before_sync_ts, true);
     }
@@ -129,16 +243,16 @@ impl<EK: KvEngine, ER: RaftEngine> SyncPolicy<EK, ER> {
     /// Try to sync and flush unsynced regions, it's called when no 'ready' comes.
     /// Return if all unsynced regions are flushed.
     pub fn try_sync_and_flush(&mut self) -> bool {
-        if !self.delay_sync_enabled {
-            return true;
-        }
-
-        if self.unsynced_regions_map.is_empty() {
-            return true;
-        }
-
-        if self.try_flush_regions() {
-            return true;
+        match self.sync_mode {
+            SyncMode::SyncIO => return true,
+            SyncMode::AsyncIO => {
+                return self.try_flush_regions();
+            }
+            SyncMode::DelaySyncIO => {
+                if self.try_flush_regions() {
+                    return true;
+                }
+            }
         }
 
         let before_sync_ts = self.current_ts();
@@ -158,6 +272,28 @@ impl<EK: KvEngine, ER: RaftEngine> SyncPolicy<EK, ER> {
         true
     }
 
+    pub fn run(&mut self) {
+        let mut plan_sync_ts = self.global_plan_sync_ts.load(Ordering::Acquire);
+        while self.local_last_sync_ts < plan_sync_ts {
+            let mut before_sync_ts = self.current_ts();
+            while before_sync_ts - self.local_last_sync_ts < self.delay_sync_us {
+                std::thread::yield_now();
+                before_sync_ts = self.current_ts();
+            }
+            self.raft_engine.sync().unwrap_or_else(|e| {
+                panic!("failed to sync raft engine: {:?}", e);
+            });
+            self.metrics.sync_events.sync_raftdb_count += 1;
+            self.update_status_after_synced(before_sync_ts);
+            plan_sync_ts = self.global_plan_sync_ts.load(Ordering::Acquire);
+            if plan_sync_ts <= self.local_last_sync_ts {
+                if !self.wait() {
+                    break;
+                }
+            }
+        }
+    }
+
     pub fn mark_region_unsynced(
         &mut self,
         region_id: u64,
@@ -165,7 +301,7 @@ impl<EK: KvEngine, ER: RaftEngine> SyncPolicy<EK, ER> {
         notify: Arc<AtomicU64>,
         current_ts: i64,
     ) {
-        if !self.delay_sync_enabled {
+        if self.sync_mode == SyncMode::SyncIO {
             return;
         }
         if let Some((_, _, prev_ts)) = self
@@ -183,7 +319,7 @@ impl<EK: KvEngine, ER: RaftEngine> SyncPolicy<EK, ER> {
     }
 
     pub fn mark_region_synced(&mut self, region_id: u64) {
-        if !self.delay_sync_enabled {
+        if self.sync_mode == SyncMode::SyncIO {
             return;
         }
         if let Some((_, _, prev_ts)) = self.unsynced_regions_map.remove(&region_id) {
@@ -322,4 +458,34 @@ impl<EK: KvEngine, ER: RaftEngine> SyncPolicy<EK, ER> {
         }
         self.unsynced_regions_map.is_empty()
     }
+
+    fn wait(&mut self) -> bool {
+        let start_wait_time = self.current_ts();
+        let mut plan_sync_ts = self.global_plan_sync_ts.load(Ordering::Acquire);
+        while plan_sync_ts <= self.local_last_sync_ts
+            && self.current_ts() - start_wait_time < self.delay_sync_us
+        {
+            std::thread::yield_now();
+            plan_sync_ts = self.global_plan_sync_ts.load(Ordering::Acquire);
+        }
+        if plan_sync_ts <= self.local_last_sync_ts {
+            let global_plan_sync_ts = self.global_last_sync_ts.clone();
+            let local_sync_ts = self.local_last_sync_ts;
+            return self
+                .notifier
+                .wait(move || global_plan_sync_ts.load(Ordering::Acquire) > local_sync_ts);
+        }
+        true
+    }
+}
+
+pub fn run_sync_thread<EK: KvEngine, ER: RaftEngine>(
+    mut policy: SyncPolicy<EK, ER>,
+) -> JoinHandle<()> {
+    Builder::new()
+        .name(thd_name!("sync-raft-wal"))
+        .spawn(move || {
+            policy.run();
+        })
+        .unwrap()
 }
