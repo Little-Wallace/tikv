@@ -157,6 +157,7 @@ early-apply = false
 dev-assert = true
 perf-level = 5
 delay-sync-us = 1500
+enable-async-io = true
 
 [coprocessor]
 split-region-on-table = false

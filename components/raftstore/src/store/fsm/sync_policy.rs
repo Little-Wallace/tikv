@@ -185,6 +185,10 @@ impl<EK: KvEngine, ER: RaftEngine> SyncPolicy<EK, ER> {
         }
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.unsynced_regions_map.is_empty()
+    }
+
     /// Check if this thread should call sync or not.
     pub fn maybe_sync(&mut self) -> bool {
         let before_sync_ts = TiInstant::now_coarse().to_microsec();
@@ -272,28 +276,6 @@ impl<EK: KvEngine, ER: RaftEngine> SyncPolicy<EK, ER> {
         true
     }
 
-    pub fn run(&mut self) {
-        let mut plan_sync_ts = self.global_plan_sync_ts.load(Ordering::Acquire);
-        while self.local_last_sync_ts < plan_sync_ts {
-            let mut before_sync_ts = self.current_ts();
-            while before_sync_ts - self.local_last_sync_ts < self.delay_sync_us {
-                std::thread::yield_now();
-                before_sync_ts = self.current_ts();
-            }
-            self.raft_engine.sync().unwrap_or_else(|e| {
-                panic!("failed to sync raft engine: {:?}", e);
-            });
-            self.metrics.sync_events.sync_raftdb_count += 1;
-            self.update_status_after_synced(before_sync_ts);
-            plan_sync_ts = self.global_plan_sync_ts.load(Ordering::Acquire);
-            if plan_sync_ts <= self.local_last_sync_ts {
-                if !self.wait() {
-                    break;
-                }
-            }
-        }
-    }
-
     pub fn mark_region_unsynced(
         &mut self,
         region_id: u64,
@@ -340,15 +322,7 @@ impl<EK: KvEngine, ER: RaftEngine> SyncPolicy<EK, ER> {
     /// Update the global status(last_sync_ts, last_plan_ts),
     fn update_status_after_synced(&mut self, before_sync_ts: i64) {
         self.local_last_sync_ts = before_sync_ts;
-
         let last_sync_ts = self.global_last_sync_ts.load(Ordering::Acquire);
-        let plan_sync_ts = self.global_plan_sync_ts.load(Ordering::Acquire);
-        assert_eq!(
-            plan_sync_ts, before_sync_ts,
-            "plan sync ts {} != before sync ts {}",
-            plan_sync_ts, before_sync_ts
-        );
-
         let pre_ts = self.global_last_sync_ts.compare_and_swap(
             last_sync_ts,
             before_sync_ts,
@@ -459,6 +433,30 @@ impl<EK: KvEngine, ER: RaftEngine> SyncPolicy<EK, ER> {
         self.unsynced_regions_map.is_empty()
     }
 
+    fn run(&mut self) {
+        let mut plan_sync_ts = self.global_plan_sync_ts.load(Ordering::Acquire);
+        loop {
+            if plan_sync_ts <= self.local_last_sync_ts {
+                if !self.wait() {
+                    return;
+                }
+                plan_sync_ts = self.global_plan_sync_ts.load(Ordering::Acquire);
+                assert!(plan_sync_ts > self.local_last_sync_ts);
+            }
+            let mut before_sync_ts = self.current_ts();
+            while before_sync_ts - self.local_last_sync_ts < self.delay_sync_us {
+                std::thread::yield_now();
+                before_sync_ts = self.current_ts();
+            }
+            self.raft_engine.sync().unwrap_or_else(|e| {
+                panic!("failed to sync raft engine: {:?}", e);
+            });
+            self.metrics.sync_events.sync_raftdb_count += 1;
+            self.update_status_after_synced(before_sync_ts);
+            plan_sync_ts = self.global_plan_sync_ts.load(Ordering::Acquire);
+        }
+    }
+
     fn wait(&mut self) -> bool {
         let start_wait_time = self.current_ts();
         let mut plan_sync_ts = self.global_plan_sync_ts.load(Ordering::Acquire);
@@ -469,7 +467,7 @@ impl<EK: KvEngine, ER: RaftEngine> SyncPolicy<EK, ER> {
             plan_sync_ts = self.global_plan_sync_ts.load(Ordering::Acquire);
         }
         if plan_sync_ts <= self.local_last_sync_ts {
-            let global_plan_sync_ts = self.global_last_sync_ts.clone();
+            let global_plan_sync_ts = self.global_plan_sync_ts.clone();
             let local_sync_ts = self.local_last_sync_ts;
             return self
                 .notifier
@@ -479,13 +477,27 @@ impl<EK: KvEngine, ER: RaftEngine> SyncPolicy<EK, ER> {
     }
 }
 
+pub struct SyncController {
+    handle: JoinHandle<()>,
+    notifier: Notifier,
+}
+
+impl SyncController {
+    pub fn stop(self) {
+        self.notifier.stop();
+        self.handle.join().unwrap();
+    }
+}
+
 pub fn run_sync_thread<EK: KvEngine, ER: RaftEngine>(
     mut policy: SyncPolicy<EK, ER>,
-) -> JoinHandle<()> {
-    Builder::new()
+) -> SyncController {
+    let notifier = policy.notifier.clone();
+    let handle = Builder::new()
         .name(thd_name!("sync-raft-wal"))
         .spawn(move || {
             policy.run();
         })
-        .unwrap()
+        .unwrap();
+    SyncController { notifier, handle }
 }

@@ -48,7 +48,7 @@ use crate::store::fsm::metrics::*;
 use crate::store::fsm::peer::{
     maybe_destroy_source, new_admin_request, PeerFsm, PeerFsmDelegate, SenderFsmPair,
 };
-use crate::store::fsm::sync_policy::{run_sync_thread, SyncPolicy};
+use crate::store::fsm::sync_policy::{run_sync_thread, SyncController, SyncPolicy};
 use crate::store::fsm::ApplyNotifier;
 use crate::store::fsm::ApplyTaskRes;
 use crate::store::fsm::{
@@ -72,7 +72,6 @@ use crate::store::{
 };
 use crate::Result;
 use concurrency_manager::ConcurrencyManager;
-use std::thread::JoinHandle;
 use tikv_util::future::poll_future_notify;
 
 type Key = Vec<u8>;
@@ -1169,7 +1168,7 @@ struct Workers<EK: KvEngine> {
     raftlog_gc_worker: Worker<RaftlogGcTask>,
     region_worker: Worker<RegionTask<EK::Snapshot>>,
     coprocessor_host: CoprocessorHost<EK>,
-    sync_handle: Option<JoinHandle<()>>,
+    sync_handle: Option<SyncController>,
 }
 
 pub struct RaftBatchSystem<EK: KvEngine, ER: RaftEngine> {
@@ -1222,7 +1221,11 @@ impl<EK: KvEngine, ER: RaftEngine> RaftBatchSystem<EK, ER> {
             cfg.value().enable_async_io,
             cfg.value().delay_sync_us as i64,
         );
-        let sync_handle = run_sync_thread(sync_policy.clone());
+        let sync_handle = if cfg.value().enable_async_io {
+            Some(run_sync_thread(sync_policy.clone()))
+        } else {
+            None
+        };
         let workers = Workers {
             split_check_worker,
             region_worker: Worker::new("snapshot-worker"),
@@ -1231,7 +1234,7 @@ impl<EK: KvEngine, ER: RaftEngine> RaftBatchSystem<EK, ER> {
             cleanup_worker: Worker::new("cleanup-worker"),
             raftlog_gc_worker: Worker::new("raft-gc-worker"),
             coprocessor_host: coprocessor_host.clone(),
-            sync_handle: Some(sync_handle),
+            sync_handle,
         };
         let mut builder = RaftPollerBuilder {
             cfg,
@@ -1412,9 +1415,11 @@ impl<EK: KvEngine, ER: RaftEngine> RaftBatchSystem<EK, ER> {
         handles.push(workers.consistency_check_worker.stop());
         handles.push(workers.cleanup_worker.stop());
         handles.push(workers.raftlog_gc_worker.stop());
-        handles.push(workers.sync_handle.take());
         self.apply_system.shutdown();
         self.system.shutdown();
+        if let Some(handle) = workers.sync_handle.take() {
+            handle.stop();
+        }
         for h in handles {
             if let Some(h) = h {
                 h.join().unwrap();

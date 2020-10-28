@@ -198,6 +198,7 @@ fn test_serde_custom_tikv_config() {
         apply_yield_duration: ReadableDuration::millis(333),
         perf_level: PerfLevel::EnableTime,
         delay_sync_us: 1500,
+        enable_async_io: true,
     };
     value.pd = PdConfig::new(vec!["example.com:443".to_owned()]);
     let titan_cf_config = TitanCfConfig {
