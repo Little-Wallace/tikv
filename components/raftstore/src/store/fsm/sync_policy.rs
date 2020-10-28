@@ -15,6 +15,7 @@ use tikv_util::time::Instant as TiInstant;
 use crate::store::fsm::RaftRouter;
 use crate::store::local_metrics::SyncEventMetrics;
 use crate::store::PeerMsg;
+use bitflags::_core::time::Duration;
 
 const UNSYNCED_REGIONS_SIZE_LIMIT: usize = 512;
 
@@ -55,6 +56,9 @@ impl Notifier {
     {
         let mut state = self.state.lock().unwrap();
         self.run.store(false, Ordering::Release);
+        if *state == SyncState::Stop {
+            return false;
+        }
         *state = SyncState::Wait;
 
         // The condiction `f` must be changed before calling `maybe_notify` so that this thread
@@ -438,6 +442,12 @@ impl<EK: KvEngine, ER: RaftEngine> SyncPolicy<EK, ER> {
         loop {
             if plan_sync_ts <= self.local_last_sync_ts {
                 if !self.wait() {
+                    // Sync again and exit.
+                    let before_sync_ts = self.current_ts();
+                    self.raft_engine.sync().unwrap_or_else(|e| {
+                        panic!("failed to sync raft engine: {:?}", e);
+                    });
+                    self.update_status_after_synced(before_sync_ts);
                     return;
                 }
                 plan_sync_ts = self.global_plan_sync_ts.load(Ordering::Acquire);
@@ -459,21 +469,18 @@ impl<EK: KvEngine, ER: RaftEngine> SyncPolicy<EK, ER> {
 
     fn wait(&mut self) -> bool {
         let start_wait_time = self.current_ts();
-        let mut plan_sync_ts = self.global_plan_sync_ts.load(Ordering::Acquire);
-        while plan_sync_ts <= self.local_last_sync_ts
-            && self.current_ts() - start_wait_time < self.delay_sync_us
-        {
-            std::thread::yield_now();
-            plan_sync_ts = self.global_plan_sync_ts.load(Ordering::Acquire);
+        const TIME_PER_SLEEP: u64 = 100;
+        let spin_for_wait_sync_request = self.delay_sync_us * 2;
+        while self.current_ts() - start_wait_time < spin_for_wait_sync_request {
+            std::thread::sleep(Duration::from_micros(TIME_PER_SLEEP));
+            if self.global_plan_sync_ts.load(Ordering::Acquire) > self.local_last_sync_ts {
+                return true;
+            }
         }
-        if plan_sync_ts <= self.local_last_sync_ts {
-            let global_plan_sync_ts = self.global_plan_sync_ts.clone();
-            let local_sync_ts = self.local_last_sync_ts;
-            return self
-                .notifier
-                .wait(move || global_plan_sync_ts.load(Ordering::Acquire) > local_sync_ts);
-        }
-        true
+        let global_plan_sync_ts = self.global_plan_sync_ts.clone();
+        let local_sync_ts = self.local_last_sync_ts;
+        self.notifier
+            .wait(move || global_plan_sync_ts.load(Ordering::Acquire) > local_sync_ts)
     }
 }
 
