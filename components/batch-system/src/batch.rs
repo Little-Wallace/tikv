@@ -260,16 +260,17 @@ impl<N: Fsm, C: Fsm, Handler: PollHandler<N, C>> Poller<N, C, Handler> {
         }
 
         if batch.is_empty() {
-            loop {
+            let now = Instant::now();
+            while now.elapsed() < Duration::from_micros(100) {
                 if self.handler.pause() {
-                    if let Ok(fsm) = self.fsm_receiver.recv() {
-                        return batch.push(fsm);
-                    }
-                } else {
-                    if let Ok(fsm) = self.fsm_receiver.recv_timeout(Duration::from_micros(100)) {
-                        return batch.push(fsm);
-                    }
+                    break;
                 }
+                if let Ok(fsm) = self.fsm_receiver.try_recv() {
+                    return batch.push(fsm);
+                }
+            }
+            if let Ok(fsm) = self.fsm_receiver.recv() {
+                return batch.push(fsm);
             }
         }
         !batch.is_empty()
