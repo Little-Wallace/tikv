@@ -1541,6 +1541,7 @@ where
         );
 
         let mut ready = self.raft_group.ready();
+        self.last_unpersisted_number = ready.number();
 
         ctx.set_sync_log(!self.unpersisted_ready.is_empty() || ready.must_sync());
         self.add_ready_metric(&ready, &mut ctx.raft_metrics.ready);
@@ -1785,7 +1786,6 @@ where
 
     pub fn mark_ready_unsynced(&mut self, ready_number: u64, ts: i64) {
         self.unpersisted_ready.push_back((ready_number, ts));
-        self.last_unpersisted_number = ready_number;
     }
 
     fn response_read<T, C>(

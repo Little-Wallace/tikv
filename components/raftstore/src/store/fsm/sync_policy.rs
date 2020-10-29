@@ -334,8 +334,6 @@ impl<EK: KvEngine, ER: RaftEngine> SyncPolicy<EK, ER> {
                     self.update_status_after_synced(before_sync_ts);
                     return;
                 }
-                plan_sync_ts = self.global_plan_sync_ts.load(Ordering::Acquire);
-                assert!(plan_sync_ts > self.local_last_sync_ts);
             }
             let mut before_sync_ts = self.current_ts();
             while before_sync_ts - self.local_last_sync_ts < self.delay_sync_us {

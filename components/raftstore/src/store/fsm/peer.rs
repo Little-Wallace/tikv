@@ -529,6 +529,10 @@ where
         !self.fsm.peer.unpersisted_ready.is_empty()
     }
 
+    pub fn has_ready(&self) -> bool {
+        self.fsm.has_ready
+    }
+
     fn propose_batch_raft_command(&mut self) {
         if let Some(cmd) = self
             .fsm
@@ -902,11 +906,11 @@ where
         }
     }
 
-    pub fn collect_ready(&mut self) {
+    pub fn collect_ready(&mut self) -> bool {
         let has_ready = self.fsm.has_ready;
         self.fsm.has_ready = false;
         if !has_ready || self.fsm.stopped {
-            return;
+            return false;
         }
         self.ctx.pending_count += 1;
         self.ctx.has_ready = true;
@@ -918,7 +922,9 @@ where
                 self.register_split_region_check_tick();
             }
             self.ctx.ready_res.push(r);
+            return true;
         }
+        false
     }
 
     pub fn post_raft_ready_append(&mut self, ready: Ready, invoke_ctx: InvokeContext) {

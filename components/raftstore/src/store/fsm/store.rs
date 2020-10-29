@@ -683,7 +683,8 @@ impl<EK: KvEngine, ER: RaftEngine, T: Transport, C: PdClient> RaftPoller<EK, ER,
                     panic!("{} failed to save raft append result: {:?}", self.tag, e);
                 });
         }
-        let need_sync = self.poll_ctx.sync_log && self.poll_ctx.sync_policy.maybe_sync();
+        let current_ts = self.poll_ctx.sync_policy.current_ts();
+        let has_sync = self.poll_ctx.sync_log && self.poll_ctx.sync_policy.maybe_sync();
 
         report_perf_context!(
             self.poll_ctx.perf_context_statistics,
@@ -692,7 +693,6 @@ impl<EK: KvEngine, ER: RaftEngine, T: Transport, C: PdClient> RaftPoller<EK, ER,
         fail_point!("raft_after_save");
 
         if ready_cnt != 0 {
-            let current_ts = self.poll_ctx.sync_policy.current_ts();
             let mut batch_pos = 0;
             let mut ready_res = mem::take(&mut self.poll_ctx.ready_res);
             for (ready, invoke_ctx) in ready_res.drain(..) {
@@ -715,12 +715,12 @@ impl<EK: KvEngine, ER: RaftEngine, T: Transport, C: PdClient> RaftPoller<EK, ER,
                 // If this peer is applying snapshot, `persist_ready` should be called
                 // after finishing apply snapshot. Otherwise, `persist_ready` can be
                 // called if raft db sync or mark this region unsynced if not sync.
-                if need_sync {
-                    if !is_applying_snapshot {
+                if !is_applying_snapshot {
+                    if has_sync {
                         peerfsm.peer.persisted_last_ready(&mut self.poll_ctx);
-                    }
-                } else {
-                    if !is_applying_snapshot && must_sync {
+                    } else if !must_sync && peerfsm.peer.unpersisted_ready.is_empty() {
+                        peerfsm.peer.persisted_last_ready(&mut self.poll_ctx);
+                    } else {
                         peerfsm.peer.mark_ready_unsynced(number, current_ts);
                     }
                 }
@@ -871,13 +871,15 @@ impl<EK: KvEngine, ER: RaftEngine, T: Transport, C: PdClient>
         }
         let mut delegate = PeerFsmDelegate::new(peer, &mut self.poll_ctx);
         delegate.check_new_persisted();
-        if !self.peer_msg_buf.is_empty() {
+        if !self.peer_msg_buf.is_empty() || delegate.has_ready() {
             delegate.handle_msgs(&mut self.peer_msg_buf);
             delegate.check_new_persisted();
-            delegate.collect_ready();
+            if delegate.collect_ready() {
+                expected_msg_count = None;
+            }
         }
         if delegate.has_unpersisted_ready() {
-            return None;
+            expected_msg_count = None;
         }
         expected_msg_count
     }
