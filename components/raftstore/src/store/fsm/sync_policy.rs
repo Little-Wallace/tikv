@@ -1,22 +1,17 @@
 // Copyright 2016 TiKV Project Authors. Licensed under Apache-2.0.
 
-use std::collections::BTreeSet;
 use std::sync::atomic::Ordering;
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64};
+use std::sync::atomic::{AtomicBool, AtomicI64};
 use std::sync::{Arc, Condvar, Mutex};
 
 use engine_traits::KvEngine;
 use engine_traits::RaftEngine;
 
 use std::thread::{Builder, JoinHandle};
-use tikv_util::collections::HashMap;
 use tikv_util::time::Instant as TiInstant;
 
 use crate::store::fsm::RaftRouter;
 use crate::store::local_metrics::SyncEventMetrics;
-use crate::store::PeerMsg;
-
-const UNSYNCED_REGIONS_SIZE_LIMIT: usize = 512;
 
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum SyncMode {
@@ -113,13 +108,6 @@ pub struct SyncPolicy<EK: KvEngine, ER: RaftEngine> {
     /// Mark the last-sync-time of this thread, for checking other threads did 'sync' or not.
     local_last_sync_ts: i64,
 
-    /// Store the unsynced regions, notify them when 'sync' is triggered and finished.
-    /// The map contains: <region_id, (ready number, atomic notifier, create_time)>
-    unsynced_regions_map: HashMap<u64, (u64, Arc<AtomicU64>, i64)>,
-    /// Used for quickly checking if timestamp reaches deadline.
-    /// The set contains: <(create_time, region_id)>
-    unsynced_regions_set: BTreeSet<(i64, u64)>,
-
     notifier: Notifier,
 }
 
@@ -148,8 +136,6 @@ impl<EK: KvEngine, ER: RaftEngine> SyncPolicy<EK, ER> {
             global_plan_sync_ts: Arc::new(AtomicI64::new(current_ts)),
             global_last_sync_ts: Arc::new(AtomicI64::new(current_ts)),
             local_last_sync_ts: current_ts,
-            unsynced_regions_map: HashMap::default(),
-            unsynced_regions_set: BTreeSet::default(),
             notifier: Notifier::new(),
         }
     }
@@ -164,8 +150,6 @@ impl<EK: KvEngine, ER: RaftEngine> SyncPolicy<EK, ER> {
             global_plan_sync_ts: self.global_plan_sync_ts.clone(),
             global_last_sync_ts: self.global_last_sync_ts.clone(),
             local_last_sync_ts: self.global_last_sync_ts.load(Ordering::Relaxed),
-            unsynced_regions_map: HashMap::default(),
-            unsynced_regions_set: BTreeSet::default(),
             notifier: self.notifier.clone(),
         }
     }
@@ -174,22 +158,20 @@ impl<EK: KvEngine, ER: RaftEngine> SyncPolicy<EK, ER> {
         TiInstant::now_coarse().to_microsec()
     }
 
-    /// Return if all unsynced regions are flushed
-    pub fn try_flush_regions(&mut self) -> bool {
-        if self.unsynced_regions_map.is_empty() {
-            return true;
-        }
+    pub fn try_refresh_last_sync_ts(&mut self) -> i64 {
         let last_sync_ts = self.global_last_sync_ts.load(Ordering::Acquire);
         if self.local_last_sync_ts < last_sync_ts {
             self.local_last_sync_ts = last_sync_ts;
-            self.flush_unsynced_regions(last_sync_ts, false)
-        } else {
-            false
         }
+        self.local_last_sync_ts
     }
 
-    pub fn is_empty(&self) -> bool {
-        self.unsynced_regions_map.is_empty()
+    /// Return if all unsynced regions are flushed
+    pub fn try_flush_regions(&mut self) {
+        let last_sync_ts = self.global_last_sync_ts.load(Ordering::Acquire);
+        if self.local_last_sync_ts < last_sync_ts {
+            self.local_last_sync_ts = last_sync_ts;
+        }
     }
 
     /// Check if this thread should call sync or not.
@@ -244,27 +226,25 @@ impl<EK: KvEngine, ER: RaftEngine> SyncPolicy<EK, ER> {
     /// Update metrics and status after the sync time point (whether did sync or not)
     fn post_sync_time_point(&mut self, before_sync_ts: i64) {
         self.update_status_after_synced(before_sync_ts);
-        self.flush_unsynced_regions(before_sync_ts, true);
     }
 
     /// Try to sync and flush unsynced regions, it's called when no 'ready' comes.
     /// Return if all unsynced regions are flushed.
-    pub fn try_sync_and_flush(&mut self) -> bool {
+    pub fn try_sync_and_flush(&mut self) {
         match self.sync_mode {
-            SyncMode::SyncIO => return true,
+            SyncMode::SyncIO => return,
             SyncMode::AsyncIO => {
-                return self.try_flush_regions();
+                self.try_flush_regions();
+                return;
             }
             SyncMode::DelaySyncIO => {
-                if self.try_flush_regions() {
-                    return true;
-                }
+                self.try_flush_regions();
             }
         }
 
         let before_sync_ts = self.current_ts();
         if !self.check_sync_internal(before_sync_ts) {
-            return false;
+            return;
         }
 
         if let Err(e) = self.raft_engine.sync() {
@@ -275,51 +255,6 @@ impl<EK: KvEngine, ER: RaftEngine> SyncPolicy<EK, ER> {
         self.metrics.sync_events.sync_raftdb_reach_deadline_no_ready += 1;
 
         self.update_status_after_synced(before_sync_ts);
-        self.flush_unsynced_regions(before_sync_ts, true);
-        true
-    }
-
-    pub fn mark_region_unsynced(
-        &mut self,
-        region_id: u64,
-        number: u64,
-        notify: Arc<AtomicU64>,
-        current_ts: i64,
-    ) {
-        if self.sync_mode == SyncMode::SyncIO {
-            return;
-        }
-        if let Some((_, _, prev_ts)) = self
-            .unsynced_regions_map
-            .insert(region_id, (number, notify, current_ts))
-        {
-            if !self.unsynced_regions_set.remove(&(prev_ts, region_id)) {
-                panic!(
-                    "sync policy metadata corrupt, region_id {}, ts {} not in set",
-                    region_id, prev_ts
-                );
-            }
-        }
-        self.unsynced_regions_set.insert((current_ts, region_id));
-    }
-
-    pub fn mark_region_synced(&mut self, region_id: u64) {
-        if self.sync_mode == SyncMode::SyncIO {
-            return;
-        }
-        if let Some((_, _, prev_ts)) = self.unsynced_regions_map.remove(&region_id) {
-            if !self.unsynced_regions_set.remove(&(prev_ts, region_id)) {
-                panic!(
-                    "sync policy metadata corrupt, region_id {}, ts {} not in set",
-                    region_id, prev_ts
-                );
-            }
-        }
-        if self.unsynced_regions_map.len() < UNSYNCED_REGIONS_SIZE_LIMIT
-            && self.unsynced_regions_map.capacity() > 2 * UNSYNCED_REGIONS_SIZE_LIMIT
-        {
-            self.unsynced_regions_map.shrink_to_fit();
-        }
     }
 
     /// Update the global status(last_sync_ts, last_plan_ts),
@@ -359,14 +294,7 @@ impl<EK: KvEngine, ER: RaftEngine> SyncPolicy<EK, ER> {
             return false;
         }
 
-        let mut need_sync = if self.unsynced_regions_map.len() > UNSYNCED_REGIONS_SIZE_LIMIT {
-            self.metrics.sync_events.sync_raftdb_delay_cache_is_full += 1;
-            true
-        } else {
-            false
-        };
-
-        need_sync |= {
+        let need_sync = {
             let elapsed = before_sync_ts - last_sync_ts;
             self.metrics
                 .thread_check_result
@@ -391,49 +319,6 @@ impl<EK: KvEngine, ER: RaftEngine> SyncPolicy<EK, ER> {
                 before_sync_ts,
                 Ordering::AcqRel,
             )
-    }
-
-    /// Return if all unsynced region are flushed
-    fn flush_unsynced_regions(&mut self, synced_ts: i64, flush_all: bool) -> bool {
-        while let Some((ts, region_id)) = self.unsynced_regions_set.iter().next() {
-            let delay_duration = synced_ts - *ts;
-            if !flush_all && delay_duration <= 0 {
-                break;
-            }
-            self.metrics
-                .sync_delay_duration
-                .observe(delay_duration as f64 / 1e9);
-
-            let (ts, region_id) = (*ts, *region_id);
-            assert_eq!(self.unsynced_regions_set.remove(&(ts, region_id)), true);
-            let (number, notifier, ts2) = self.unsynced_regions_map.remove(&region_id).unwrap();
-            assert_eq!(ts, ts2);
-
-            loop {
-                let pre_number = notifier.load(Ordering::Acquire);
-                assert_ne!(pre_number, number);
-                if pre_number > number {
-                    break;
-                }
-                if pre_number == notifier.compare_and_swap(pre_number, number, Ordering::AcqRel) {
-                    if let Err(e) = self.router.force_send(region_id, PeerMsg::Noop) {
-                        debug!(
-                            "failed to send noop to trigger persisted ready";
-                            "region_id" => region_id,
-                            "ready_number" => number,
-                            "error" => ?e,
-                        );
-                    }
-                    break;
-                }
-            }
-        }
-        if self.unsynced_regions_map.len() < UNSYNCED_REGIONS_SIZE_LIMIT
-            && self.unsynced_regions_map.capacity() > 2 * UNSYNCED_REGIONS_SIZE_LIMIT
-        {
-            self.unsynced_regions_map.shrink_to_fit();
-        }
-        self.unsynced_regions_map.is_empty()
     }
 
     fn run(&mut self) {

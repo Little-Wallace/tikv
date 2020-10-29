@@ -229,9 +229,7 @@ pub trait PollHandler<N, C> {
     /// This function is called when batch system is going to sleep.
     /// If the FSM still have works to do, it will return false to inform
     /// the poller.
-    fn pause(&mut self) -> bool {
-        true
-    }
+    fn pause(&mut self) {}
 }
 
 /// Internal poller that fetches batch and call handler hooks for readiness.
@@ -260,15 +258,7 @@ impl<N: Fsm, C: Fsm, Handler: PollHandler<N, C>> Poller<N, C, Handler> {
         }
 
         if batch.is_empty() {
-            let now = Instant::now();
-            while now.elapsed() < Duration::from_micros(100) {
-                if self.handler.pause() {
-                    break;
-                }
-                if let Ok(fsm) = self.fsm_receiver.try_recv() {
-                    return batch.push(fsm);
-                }
-            }
+            self.handler.pause();
             if let Ok(fsm) = self.fsm_receiver.recv() {
                 return batch.push(fsm);
             }

@@ -330,6 +330,7 @@ where
     pub pending_count: usize,
     pub sync_log: bool,
     pub has_ready: bool,
+    pub has_unpersisted_ready: bool,
     pub ready_res: Vec<(Ready, InvokeContext)>,
     pub need_flush_trans: bool,
     pub current_time: Option<Timespec>,
@@ -682,7 +683,7 @@ impl<EK: KvEngine, ER: RaftEngine, T: Transport, C: PdClient> RaftPoller<EK, ER,
                     panic!("{} failed to save raft append result: {:?}", self.tag, e);
                 });
         }
-        let need_sync = self.poll_ctx.sync_policy.maybe_sync();
+        let need_sync = self.poll_ctx.sync_log && self.poll_ctx.sync_policy.maybe_sync();
 
         report_perf_context!(
             self.poll_ctx.perf_context_statistics,
@@ -704,6 +705,7 @@ impl<EK: KvEngine, ER: RaftEngine, T: Transport, C: PdClient> RaftPoller<EK, ER,
                 }
                 let number = ready.number();
                 let has_snapshot = !ready.snapshot().is_empty();
+                let must_sync = ready.must_sync();
                 PeerFsmDelegate::new(&mut peers[batch_pos], &mut self.poll_ctx)
                     .post_raft_ready_append(ready, invoke_ctx);
 
@@ -717,16 +719,9 @@ impl<EK: KvEngine, ER: RaftEngine, T: Transport, C: PdClient> RaftPoller<EK, ER,
                     if !is_applying_snapshot {
                         peerfsm.peer.persisted_last_ready(&mut self.poll_ctx);
                     }
-                    self.poll_ctx.sync_policy.mark_region_synced(region_id);
                 } else {
-                    if !is_applying_snapshot {
-                        // TODO: if this region has no data in raft_wb, we don't need to mark it unsynced.
-                        self.poll_ctx.sync_policy.mark_region_unsynced(
-                            region_id,
-                            number,
-                            peerfsm.peer.persisted_notifier(),
-                            current_ts,
-                        );
+                    if !is_applying_snapshot && must_sync {
+                        peerfsm.peer.mark_ready_unsynced(number, current_ts);
                     }
                 }
             }
@@ -875,8 +870,15 @@ impl<EK: KvEngine, ER: RaftEngine, T: Transport, C: PdClient>
             }
         }
         let mut delegate = PeerFsmDelegate::new(peer, &mut self.poll_ctx);
-        delegate.handle_msgs(&mut self.peer_msg_buf);
-        delegate.collect_ready();
+        delegate.check_new_persisted();
+        if !self.peer_msg_buf.is_empty() {
+            delegate.handle_msgs(&mut self.peer_msg_buf);
+            delegate.check_new_persisted();
+            delegate.collect_ready();
+        }
+        if delegate.has_unpersisted_ready() {
+            return None;
+        }
         expected_msg_count
     }
 
@@ -884,26 +886,27 @@ impl<EK: KvEngine, ER: RaftEngine, T: Transport, C: PdClient>
         self.flush_ticks();
         if self.poll_ctx.has_ready {
             self.handle_raft_ready(peers);
+            self.poll_ctx
+                .raft_metrics
+                .process_ready
+                .observe(duration_to_sec(self.timer.elapsed()) as f64);
+            self.poll_ctx.raft_metrics.flush();
+            self.poll_ctx.sync_policy.metrics.flush();
+            self.poll_ctx.store_stat.flush();
+        } else if self.poll_ctx.has_unpersisted_ready {
+            self.poll_ctx.sync_policy.maybe_sync();
         }
         self.poll_ctx.current_time = None;
-        self.poll_ctx
-            .raft_metrics
-            .process_ready
-            .observe(duration_to_sec(self.timer.elapsed()) as f64);
-        self.poll_ctx.raft_metrics.flush();
-        self.poll_ctx.sync_policy.metrics.flush();
-        self.poll_ctx.store_stat.flush();
+        self.poll_ctx.has_unpersisted_ready = false;
     }
 
-    fn pause(&mut self) -> bool {
-        let all_synced_and_flushed = self.poll_ctx.sync_policy.try_sync_and_flush();
+    fn pause(&mut self) {
         if self.poll_ctx.need_flush_trans {
             self.poll_ctx.trans.flush();
             self.poll_ctx.need_flush_trans = false;
         }
         // If there are cached data and go into pause status, that will cause high latency or hunger
         // so it should return false(means pause failed) when there are still jobs to do
-        all_synced_and_flushed
     }
 }
 
@@ -1143,6 +1146,7 @@ where
             tick_batch: vec![PeerTickBatch::default(); 256],
             node_start_time: Some(TiInstant::now_coarse()),
             sync_policy: self.sync_policy.clone(),
+            has_unpersisted_ready: false,
         };
         ctx.update_ticks_timeout();
         let tag = format!("[store {}]", ctx.store.get_id());

@@ -61,6 +61,7 @@ use super::util::{
     Lease, LeaseState, ADMIN_CMD_EPOCH_MAP, NORMAL_REQ_CHECK_CONF_VER, NORMAL_REQ_CHECK_VER,
 };
 use super::DestroyPeerJob;
+use crate::store::peer_storage::HandleRaftReadyContext;
 
 const SHRINK_CACHE_CAPACITY: usize = 64;
 const MIN_BCAST_WAKE_UP_INTERVAL: u64 = 1_000; // 1s
@@ -467,11 +468,9 @@ where
     /// Check whether this proposal can be proposed based on its epoch.
     cmd_epoch_checker: CmdEpochChecker<EK::Snapshot>,
     /// The number of the last unpersisted ready.
-    last_unpersisted_number: u64,
-    /// The number of the last persisted ready.
-    last_persisted_number: u64,
+    pub last_unpersisted_number: u64,
     /// Outside code use it to notify new persisted number to this peer.
-    persisted_notifier: Arc<AtomicU64>,
+    pub unpersisted_ready: VecDeque<(u64, i64)>,
 }
 
 impl<EK, ER> Peer<EK, ER>
@@ -564,8 +563,7 @@ where
             max_ts_sync_status: Arc::new(AtomicU64::new(0)),
             cmd_epoch_checker: Default::default(),
             last_unpersisted_number: 0,
-            last_persisted_number: 0,
-            persisted_notifier: Arc::new(AtomicU64::new(0)),
+            unpersisted_ready: VecDeque::new(),
         };
 
         // If this region has only one peer and I am the one, campaign directly.
@@ -1471,8 +1469,6 @@ where
             CheckApplyingSnapStatus::Success => {
                 self.post_pending_read_index_on_replica(ctx);
                 // If there is a snapshot, it must belongs to the last ready.
-                self.persisted_notifier
-                    .store(self.last_unpersisted_number, Ordering::Release);
                 self.persisted_ready(self.last_unpersisted_number);
             }
             CheckApplyingSnapStatus::Idle => {}
@@ -1546,8 +1542,7 @@ where
 
         let mut ready = self.raft_group.ready();
 
-        self.last_unpersisted_number = ready.number();
-
+        ctx.set_sync_log(!self.unpersisted_ready.is_empty() || ready.must_sync());
         self.add_ready_metric(&ready, &mut ctx.raft_metrics.ready);
 
         self.on_role_changed(ctx, &ready);
@@ -1740,28 +1735,25 @@ where
         self.proposals.gc();
     }
 
-    pub fn check_new_persisted(&mut self) -> bool {
-        if self.last_unpersisted_number == self.last_persisted_number {
+    pub fn check_new_persisted(&mut self, global_ts: i64) -> bool {
+        if self.unpersisted_ready.is_empty() {
             return false;
         }
-        let number = self.persisted_notifier.load(Ordering::Acquire);
-        assert!(
-            number <= self.last_unpersisted_number,
-            "{} persisted number {} > last unpersisted number {}",
-            self.tag,
-            number,
-            self.last_unpersisted_number
-        );
-        if number > self.last_persisted_number {
-            self.persisted_ready(number);
-            true
-        } else {
-            false
+        let mut has_ready = false;
+        while let Some((number, ts)) = self.unpersisted_ready.front() {
+            if *ts < global_ts {
+                let ready_number = *number;
+                self.persisted_ready(ready_number);
+                self.unpersisted_ready.pop_front();
+                has_ready = true;
+            } else {
+                break;
+            }
         }
+        has_ready
     }
 
     fn persisted_ready(&mut self, number: u64) {
-        self.last_persisted_number = number;
         self.raft_group.on_persist_ready(number);
     }
 
@@ -1772,9 +1764,7 @@ where
             self.tag
         );
         // Update the last persisted number and persisted notifier
-        self.last_persisted_number = self.last_unpersisted_number;
-        self.persisted_notifier
-            .store(self.last_persisted_number, Ordering::Release);
+        self.unpersisted_ready.clear();
 
         let mut res = self.raft_group.on_persist_last_ready();
         if let Some(commit_index) = res.commit_index() {
@@ -1793,8 +1783,9 @@ where
         self.handle_raft_committed_entries(ctx, res.take_committed_entries());
     }
 
-    pub fn persisted_notifier(&self) -> Arc<AtomicU64> {
-        self.persisted_notifier.clone()
+    pub fn mark_ready_unsynced(&mut self, ready_number: u64, ts: i64) {
+        self.unpersisted_ready.push_back((ready_number, ts));
+        self.last_unpersisted_number = ready_number;
     }
 
     fn response_read<T, C>(

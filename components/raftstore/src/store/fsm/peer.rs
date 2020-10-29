@@ -472,7 +472,6 @@ where
 
     pub fn handle_msgs(&mut self, msgs: &mut Vec<PeerMsg<EK>>) {
         for m in msgs.drain(..) {
-            self.fsm.has_ready |= self.fsm.peer.check_new_persisted();
             match m {
                 PeerMsg::RaftMessage(msg) => {
                     if let Err(e) = self.on_raft_message(msg) {
@@ -518,6 +517,16 @@ where
         }
         // Propose batch request which may be still waiting for more raft-command
         self.propose_batch_raft_command();
+    }
+
+    pub fn check_new_persisted(&mut self) {
+        let global_ts = self.ctx.sync_policy.try_refresh_last_sync_ts();
+        self.fsm.has_ready |= self.fsm.peer.check_new_persisted(global_ts);
+        self.ctx.has_unpersisted_ready |= self.has_unpersisted_ready();
+    }
+
+    pub fn has_unpersisted_ready(&self) -> bool {
+        !self.fsm.peer.unpersisted_ready.is_empty()
     }
 
     fn propose_batch_raft_command(&mut self) {

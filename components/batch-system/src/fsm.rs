@@ -29,6 +29,9 @@ pub trait Fsm {
     type Message: Send;
 
     fn is_stopped(&self) -> bool;
+    fn can_release(&self) -> bool {
+        true
+    }
 
     /// Set a mailbox to Fsm, which should be used to send message to itself.
     fn set_mailbox(&mut self, _mailbox: Cow<'_, BasicMailbox<Self>>)
