@@ -522,7 +522,6 @@ where
     pub fn check_new_persisted(&mut self) {
         let global_ts = self.ctx.sync_policy.try_refresh_last_sync_ts();
         self.fsm.has_ready |= self.fsm.peer.check_new_persisted(global_ts);
-        self.ctx.has_unpersisted_ready |= self.has_unpersisted_ready();
     }
 
     pub fn has_unpersisted_ready(&self) -> bool {

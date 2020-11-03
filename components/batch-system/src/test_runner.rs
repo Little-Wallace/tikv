@@ -102,6 +102,10 @@ impl PollHandler<Runner, Runner> for Handler {
         self.handle(normal)
     }
 
+    fn processed_msg_count(&self) -> usize {
+        self.local.normal
+    }
+
     fn end(&mut self, _normals: &mut [Box<Runner>]) {
         let mut c = self.metrics.lock().unwrap();
         *c += self.local;

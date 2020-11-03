@@ -223,6 +223,9 @@ pub trait PollHandler<N, C> {
     /// The returned value is handled in the same way as `handle_control`.
     fn handle_normal(&mut self, normal: &mut N) -> Option<usize>;
 
+    /// return the number of message which has been processed.
+    fn processed_msg_count(&self) -> usize;
+
     /// This function is called at the end of every round.
     fn end(&mut self, batch: &mut [Box<N>]);
 
@@ -275,6 +278,9 @@ impl<N: Fsm, C: Fsm, Handler: PollHandler<N, C>> Poller<N, C, Handler> {
         // from becoming hungry if some regions are hot points. Since we fetch new fsm every time
         // calling `poll`, we do not need to configure a large value for `self.max_batch_size`.
         let mut run = true;
+        const MAX_SLEEP_US: u64 = 5120;
+        const MIN_SLEEP_US: u64 = 80;
+        let mut cur_sleep = MIN_SLEEP_US;
         while run && self.fetch_fsm(&mut batch) {
             // If there is some region wait to be deal, we must deal with it even if it has overhead
             // max size of batch. It's helpful to protect regions from becoming hungry
@@ -312,6 +318,7 @@ impl<N: Fsm, C: Fsm, Handler: PollHandler<N, C>> Poller<N, C, Handler> {
                     }
                 }
             }
+
             let mut fsm_cnt = batch.normals.len();
             while batch.normals.len() < max_batch_size {
                 if let Ok(fsm) = self.fsm_receiver.try_recv() {
@@ -320,7 +327,10 @@ impl<N: Fsm, C: Fsm, Handler: PollHandler<N, C>> Poller<N, C, Handler> {
                 // If we receive a ControlFsm, break this cycle and call `end`. Because ControlFsm
                 // may change state of the handler, we shall deal with it immediately after
                 // calling `begin` of `Handler`.
-                if !run || fsm_cnt >= batch.normals.len() {
+                if !run
+                    || fsm_cnt >= batch.normals.len()
+                    || self.handler.processed_msg_count() > 1024
+                {
                     break;
                 }
                 let len = self.handler.handle_normal(&mut batch.normals[fsm_cnt]);
@@ -341,6 +351,14 @@ impl<N: Fsm, C: Fsm, Handler: PollHandler<N, C>> Poller<N, C, Handler> {
                     ReschedulePolicy::Remove => batch.remove(r),
                     ReschedulePolicy::Schedule => batch.reschedule(&self.router, r),
                 }
+            }
+            if self.handler.processed_msg_count() == 0 {
+                std::thread::sleep(Duration::from_micros(cur_sleep));
+                if cur_sleep < MAX_SLEEP_US {
+                    cur_sleep <<= 1;
+                }
+            } else {
+                cur_sleep = MIN_SLEEP_US;
             }
         }
         batch.clear();

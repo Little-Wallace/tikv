@@ -330,7 +330,6 @@ where
     pub pending_count: usize,
     pub sync_log: bool,
     pub has_ready: bool,
-    pub has_unpersisted_ready: bool,
     pub ready_res: Vec<(Ready, InvokeContext)>,
     pub need_flush_trans: bool,
     pub current_time: Option<Timespec>,
@@ -338,6 +337,7 @@ where
     pub tick_batch: Vec<PeerTickBatch>,
     pub node_start_time: Option<TiInstant>,
     pub sync_policy: SyncPolicy<EK, ER>,
+    pub msg_count: usize,
 }
 
 impl<EK, ER, T, C> HandleRaftReadyContext<EK::WriteBatch, ER::LogBatch>
@@ -809,6 +809,7 @@ impl<EK: KvEngine, ER: RaftEngine, T: Transport, C: PdClient>
             self.poll_ctx.update_ticks_timeout();
         }
         self.poll_ctx.sync_policy.try_flush_regions();
+        self.poll_ctx.msg_count = 0;
     }
 
     fn handle_control(&mut self, store: &mut StoreFsm<EK>) -> Option<usize> {
@@ -871,6 +872,7 @@ impl<EK: KvEngine, ER: RaftEngine, T: Transport, C: PdClient>
         }
         let mut delegate = PeerFsmDelegate::new(peer, &mut self.poll_ctx);
         delegate.check_new_persisted();
+        let msg_count = self.peer_msg_buf.len();
         if !self.peer_msg_buf.is_empty() || delegate.has_ready() {
             delegate.handle_msgs(&mut self.peer_msg_buf);
             delegate.check_new_persisted();
@@ -881,7 +883,12 @@ impl<EK: KvEngine, ER: RaftEngine, T: Transport, C: PdClient>
         if delegate.has_unpersisted_ready() {
             expected_msg_count = None;
         }
+        self.poll_ctx.msg_count += msg_count;
         expected_msg_count
+    }
+
+    fn processed_msg_count(&self) -> usize {
+        self.poll_ctx.msg_count
     }
 
     fn end(&mut self, peers: &mut [Box<PeerFsm<EK, ER>>]) {
@@ -895,11 +902,8 @@ impl<EK: KvEngine, ER: RaftEngine, T: Transport, C: PdClient>
             self.poll_ctx.raft_metrics.flush();
             self.poll_ctx.sync_policy.metrics.flush();
             self.poll_ctx.store_stat.flush();
-        } else if self.poll_ctx.has_unpersisted_ready {
-            self.poll_ctx.sync_policy.maybe_sync();
         }
         self.poll_ctx.current_time = None;
-        self.poll_ctx.has_unpersisted_ready = false;
     }
 
     fn pause(&mut self) {
@@ -1148,7 +1152,7 @@ where
             tick_batch: vec![PeerTickBatch::default(); 256],
             node_start_time: Some(TiInstant::now_coarse()),
             sync_policy: self.sync_policy.clone(),
-            has_unpersisted_ready: false,
+            msg_count: 0,
         };
         ctx.update_ticks_timeout();
         let tag = format!("[store {}]", ctx.store.get_id());

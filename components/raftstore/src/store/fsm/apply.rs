@@ -3505,6 +3505,10 @@ where
         expected_msg_count
     }
 
+    fn processed_msg_count(&self) -> usize {
+        self.apply_ctx.committed_count
+    }
+
     fn end(&mut self, fsms: &mut [Box<ApplyFsm<EK>>]) {
         let is_synced = self.apply_ctx.flush();
         if is_synced {
