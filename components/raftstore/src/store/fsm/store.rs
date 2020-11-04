@@ -906,6 +906,9 @@ impl<EK: KvEngine, ER: RaftEngine, T: Transport, C: PdClient>
         } else if self.poll_ctx.has_unpersisted_ready {
             self.poll_ctx.sync_policy.maybe_sync();
         }
+        if self.poll_ctx.msg_count == 0 {
+            self.pause();
+        }
         self.poll_ctx.has_unpersisted_ready = false;
         self.poll_ctx.current_time = None;
     }
