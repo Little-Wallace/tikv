@@ -12,6 +12,7 @@ use tikv_util::time::Instant as TiInstant;
 
 use crate::store::fsm::RaftRouter;
 use crate::store::local_metrics::SyncEventMetrics;
+use bitflags::_core::time::Duration;
 
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum SyncMode {
@@ -323,6 +324,7 @@ impl<EK: KvEngine, ER: RaftEngine> SyncPolicy<EK, ER> {
 
     fn run(&mut self) {
         let mut plan_sync_ts = self.global_plan_sync_ts.load(Ordering::Acquire);
+        const SLEEP_DELAY_US: u64 = 200;
         loop {
             if plan_sync_ts <= self.local_last_sync_ts {
                 if !self.wait() {
@@ -337,7 +339,7 @@ impl<EK: KvEngine, ER: RaftEngine> SyncPolicy<EK, ER> {
             }
             let mut before_sync_ts = self.current_ts();
             while before_sync_ts - self.local_last_sync_ts < self.delay_sync_us {
-                std::thread::yield_now();
+                std::thread::sleep(Duration::from_micros(SLEEP_DELAY_US));
                 before_sync_ts = self.current_ts();
             }
             self.raft_engine.sync().unwrap_or_else(|e| {

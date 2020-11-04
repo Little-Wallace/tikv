@@ -330,6 +330,7 @@ where
     pub pending_count: usize,
     pub sync_log: bool,
     pub has_ready: bool,
+    pub has_unpersisted_ready: bool,
     pub ready_res: Vec<(Ready, InvokeContext)>,
     pub need_flush_trans: bool,
     pub current_time: Option<Timespec>,
@@ -902,7 +903,10 @@ impl<EK: KvEngine, ER: RaftEngine, T: Transport, C: PdClient>
             self.poll_ctx.raft_metrics.flush();
             self.poll_ctx.sync_policy.metrics.flush();
             self.poll_ctx.store_stat.flush();
+        } else if self.poll_ctx.has_unpersisted_ready {
+            self.poll_ctx.sync_policy.maybe_sync();
         }
+        self.poll_ctx.has_unpersisted_ready = false;
         self.poll_ctx.current_time = None;
     }
 
@@ -1152,6 +1156,7 @@ where
             tick_batch: vec![PeerTickBatch::default(); 256],
             node_start_time: Some(TiInstant::now_coarse()),
             sync_policy: self.sync_policy.clone(),
+            has_unpersisted_ready: false,
             msg_count: 0,
         };
         ctx.update_ticks_timeout();
