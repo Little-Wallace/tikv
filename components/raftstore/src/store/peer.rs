@@ -2118,7 +2118,7 @@ where
     pub fn propose<T: Transport>(
         &mut self,
         ctx: &mut PollContext<EK, ER, T>,
-        mut cb: Callback<EK::Snapshot>,
+        cb: Callback<EK::Snapshot>,
         req: RaftCmdRequest,
         mut err_resp: RaftCmdResponse,
     ) -> bool {
@@ -2174,7 +2174,7 @@ where
     pub fn propose_v2<T: Transport>(
         &mut self,
         ctx: &mut PollContext<EK, ER, T>,
-        mut cb: Callback<EK::Snapshot>,
+        cb: Callback<EK::Snapshot>,
         header: RaftRequestHeader,
         data: Vec<u8>,
         mut err_resp: RaftCmdResponse,

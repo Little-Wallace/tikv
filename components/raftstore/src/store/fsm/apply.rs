@@ -780,6 +780,8 @@ where
 
     /// The local metrics, and it will be flushed periodically.
     metrics: ApplyMetrics,
+
+    key_buf: Vec<u8>,
 }
 
 impl<EK> ApplyDelegate<EK>
@@ -807,6 +809,7 @@ where
             last_merge_version: 0,
             pending_request_snapshot_count: reg.pending_request_snapshot_count,
             observe_cmd: None,
+            key_buf: Vec::default(),
         }
     }
 
@@ -1056,8 +1059,8 @@ where
         let mut resp = match util::compare_region_epoch(
             epoch,
             &self.region,
-            false, /* check_conf_ver */
-            true,  /* check_ver */
+            util::NORMAL_REQ_CHECK_CONF_VER, /* check_conf_ver */
+            util::NORMAL_REQ_CHECK_VER,  /* check_ver */
             include_region,
         ) {
             Ok(()) => {
@@ -1065,10 +1068,10 @@ where
                 for (t, cf, key, value) in apply_ctx.entry_reader.iter(data) {
                     match t {
                         ValueType::Put => {
-                            self.metrics.size_diff_hint += key.len() as i64;
+                            let data_key = keys::data_key_with_buff(&mut self.key_buf, key);
+                            self.metrics.size_diff_hint += data_key.len() as i64;
                             self.metrics.size_diff_hint += value.len() as i64;
-                            let data_key = keys::data_key(key);
-                            wb.put_cf(cf, &data_key, value).unwrap_or_else(|e| {
+                            wb.put_cf(cf, data_key, value).unwrap_or_else(|e| {
                                 panic!(
                                     "{} failed to append data of entry (index: {}, term: {}): {:?}",
                                     self.tag, index, term, e
@@ -1076,9 +1079,9 @@ where
                             });
                         }
                         ValueType::Delete => {
-                            self.metrics.size_diff_hint -= key.len() as i64;
-                            let data_key = keys::data_key(key);
-                            wb.delete_cf(cf, &data_key).unwrap_or_else(|e| {
+                            let data_key = keys::data_key_with_buff(&mut self.key_buf, key);
+                            self.metrics.size_diff_hint -= data_key.len() as i64;
+                            wb.delete_cf(cf, data_key).unwrap_or_else(|e| {
                                 panic!(
                                     "{} failed to append data of entry (index: {}, term: {}): {:?}",
                                     self.tag, index, term, e
@@ -4341,29 +4344,25 @@ mod tests {
 
         fn put(self, key: &[u8], value: &[u8]) -> WriteBatchEntryBuilder {
             let mut b = self;
-            let k = keys::data_key(key);
-            b.wb.put(&k, value).unwrap();
+            b.wb.put(key, value).unwrap();
             b
         }
 
         fn put_cf(self, cf: &str, key: &[u8], value: &[u8]) -> WriteBatchEntryBuilder {
             let mut b = self;
-            let k = keys::data_key(key);
-            b.wb.put_cf(cf, &k, value).unwrap();
+            b.wb.put_cf(cf, key, value).unwrap();
             b
         }
 
         fn delete(self, key: &[u8]) -> WriteBatchEntryBuilder {
             let mut b = self;
-            let k = keys::data_key(key);
-            b.wb.delete(&k).unwrap();
+            b.wb.delete(key).unwrap();
             b
         }
 
         fn delete_cf(self, cf: &str, key: &[u8]) -> WriteBatchEntryBuilder {
             let mut b = self;
-            let k = keys::data_key(key);
-            b.wb.delete_cf(cf, &k).unwrap();
+            b.wb.delete_cf(cf, key).unwrap();
             b
         }
 
