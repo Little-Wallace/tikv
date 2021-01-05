@@ -11,12 +11,12 @@ use std::{sync::atomic::Ordering, sync::Arc, time::Duration};
 use bitflags::bitflags;
 use concurrency_manager::ConcurrencyManager;
 use engine_rocks::{RocksEngine, RocksSnapshot, RocksTablePropertiesCollection};
-use engine_traits::CF_DEFAULT;
 use engine_traits::{CfName, KvEngine};
 use engine_traits::{
     IterOptions, MvccProperties, MvccPropertiesExt, Peekable, ReadOptions, Snapshot,
     TablePropertiesExt,
 };
+use engine_traits::{Mutable, WriteBatchExt, CF_DEFAULT};
 use kvproto::kvrpcpb::Context;
 use kvproto::raft_cmdpb::{
     CmdType, DeleteRangeRequest, DeleteRequest, PutRequest, RaftCmdRequest, RaftCmdResponse,
@@ -134,6 +134,7 @@ where
     router: S,
     engine: RocksEngine,
     txn_extra_scheduler: Option<Arc<dyn TxnExtraScheduler>>,
+    enable_entry_format_v2: bool,
 }
 
 pub enum CmdRes {
@@ -198,6 +199,7 @@ where
             router,
             engine,
             txn_extra_scheduler: None,
+            enable_entry_format_v2: false,
         }
     }
 
@@ -245,9 +247,7 @@ where
         ctx: &Context,
         reqs: Vec<Request>,
         txn_extra: TxnExtra,
-        write_cb: Callback<CmdRes>,
-        proposed_cb: Option<ExtCallback>,
-        committed_cb: Option<ExtCallback>,
+        cb: StoreCallback<RocksSnapshot>,
     ) -> Result<()> {
         #[cfg(feature = "failpoints")]
         {
@@ -271,7 +271,6 @@ where
             raftkv_early_error_report_fp()?;
         }
 
-        let len = reqs.len();
         let mut header = self.new_request_header(ctx);
         if txn_extra.one_pc {
             header.set_flags(WriteBatchFlags::ONE_PC.bits());
@@ -287,19 +286,62 @@ where
             }
         }
 
+        self.router.send_command(cmd, cb).map_err(From::from)
+    }
+
+    fn async_write_raw_format(
+        &self,
+        ctx: &Context,
+        batch: WriteData,
+        cb: StoreCallback<RocksSnapshot>,
+    ) -> Result<()> {
+        fail_point!("raftkv_async_write");
+        let mut wb = self.engine.write_batch();
+        for m in batch.modifies {
+            match m {
+                Modify::Delete(cf, k) => {
+                    if cf != CF_DEFAULT {
+                        wb.delete_cf(cf, k.as_encoded()).unwrap();
+                    } else {
+                        wb.delete(k.as_encoded()).unwrap();
+                    }
+                }
+                Modify::Put(cf, k, v) => {
+                    if cf != CF_DEFAULT {
+                        wb.put_cf(cf, k.as_encoded(), &v).unwrap();
+                    } else {
+                        wb.put(k.as_encoded(), &v).unwrap();
+                    }
+                }
+                _ => (),
+            }
+        }
+        let header = self.new_request_header(ctx);
+
+        if let Some(tx) = self.txn_extra_scheduler.as_ref() {
+            if !batch.extra.is_empty() {
+                tx.schedule(batch.extra);
+            }
+        }
+        let data = wb.data().to_vec();
         self.router
-            .send_command(
-                cmd,
-                StoreCallback::write_ext(
-                    Box::new(move |resp| {
-                        let (cb_ctx, res) = on_write_result(resp, len);
-                        write_cb((cb_ctx, res.map_err(Error::into)));
-                    }),
-                    proposed_cb,
-                    committed_cb,
-                ),
-            )
+            .send_command_v2(header, data, cb)
             .map_err(From::from)
+    }
+
+    fn support_command_v2(&self, batch: &WriteData) -> bool {
+        if !self.enable_entry_format_v2 {
+            return false;
+        }
+        if batch.extra.one_pc {
+            return false;
+        }
+        for m in &batch.modifies {
+            if let Modify::DeleteRange(_, _, _, _) = m {
+                return false;
+            }
+        }
+        true
     }
 }
 
@@ -395,6 +437,45 @@ where
             return Err(KvError::from(KvErrorInner::EmptyRequest));
         }
 
+        ASYNC_REQUESTS_COUNTER_VEC.write.all.inc();
+        let begin_instant = Instant::now_coarse();
+        let len = batch.modifies.len();
+
+        let cb = StoreCallback::write_ext(
+            Box::new(move |resp| {
+                let (cb_ctx, res) = on_write_result(resp, len);
+                match res {
+                    Ok(CmdRes::Resp(_)) => {
+                        ASYNC_REQUESTS_COUNTER_VEC.write.success.inc();
+                        ASYNC_REQUESTS_DURATIONS_VEC
+                            .write
+                            .observe(begin_instant.elapsed_secs());
+                        fail_point!("raftkv_async_write_finish");
+                        write_cb((cb_ctx, Ok(())))
+                    }
+                    Ok(CmdRes::Snap(_)) => write_cb((
+                        cb_ctx,
+                        Err(box_err!("unexpect snapshot, should mutate instead.")),
+                    )),
+                    Err(e) => {
+                        let e = e.into();
+                        let status_kind = get_status_kind_from_engine_error(&e);
+                        ASYNC_REQUESTS_COUNTER_VEC.write.get(status_kind).inc();
+                        write_cb((cb_ctx, Err(e)))
+                    }
+                }
+            }),
+            proposed_cb,
+            committed_cb,
+        );
+        if self.support_command_v2(&batch) {
+            return self.async_write_raw_format(ctx, batch, cb).map_err(|e| {
+                let status_kind = get_status_kind_from_error(&e);
+                ASYNC_REQUESTS_COUNTER_VEC.write.get(status_kind).inc();
+                e.into()
+            });
+        }
+
         let mut reqs = Vec::with_capacity(batch.modifies.len());
         for m in batch.modifies {
             let mut req = Request::default();
@@ -431,40 +512,12 @@ where
             reqs.push(req);
         }
 
-        ASYNC_REQUESTS_COUNTER_VEC.write.all.inc();
-        let begin_instant = Instant::now_coarse();
-
-        self.exec_write_requests(
-            ctx,
-            reqs,
-            batch.extra,
-            Box::new(move |(cb_ctx, res)| match res {
-                Ok(CmdRes::Resp(_)) => {
-                    ASYNC_REQUESTS_COUNTER_VEC.write.success.inc();
-                    ASYNC_REQUESTS_DURATIONS_VEC
-                        .write
-                        .observe(begin_instant.elapsed_secs());
-                    fail_point!("raftkv_async_write_finish");
-                    write_cb((cb_ctx, Ok(())))
-                }
-                Ok(CmdRes::Snap(_)) => write_cb((
-                    cb_ctx,
-                    Err(box_err!("unexpect snapshot, should mutate instead.")),
-                )),
-                Err(e) => {
-                    let status_kind = get_status_kind_from_engine_error(&e);
-                    ASYNC_REQUESTS_COUNTER_VEC.write.get(status_kind).inc();
-                    write_cb((cb_ctx, Err(e)))
-                }
-            }),
-            proposed_cb,
-            committed_cb,
-        )
-        .map_err(|e| {
-            let status_kind = get_status_kind_from_error(&e);
-            ASYNC_REQUESTS_COUNTER_VEC.write.get(status_kind).inc();
-            e.into()
-        })
+        self.exec_write_requests(ctx, reqs, batch.extra, cb)
+            .map_err(|e| {
+                let status_kind = get_status_kind_from_error(&e);
+                ASYNC_REQUESTS_COUNTER_VEC.write.get(status_kind).inc();
+                e.into()
+            })
     }
 
     fn async_snapshot(&self, mut ctx: SnapContext<'_>, cb: Callback<Self::Snap>) -> kv::Result<()> {

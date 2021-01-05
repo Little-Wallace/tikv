@@ -9,7 +9,7 @@ use kvproto::kvrpcpb::{ExtraOp as TxnExtraOp, LeaderInfo};
 use kvproto::metapb;
 use kvproto::metapb::RegionEpoch;
 use kvproto::pdpb::CheckPolicy;
-use kvproto::raft_cmdpb::{RaftCmdRequest, RaftCmdResponse};
+use kvproto::raft_cmdpb::{RaftCmdRequest, RaftCmdResponse, RaftRequestHeader};
 use kvproto::raft_serverpb::RaftMessage;
 use kvproto::replication_modepb::ReplicationStatus;
 use raft::SnapshotStatus;
@@ -416,6 +416,29 @@ impl<S: Snapshot> RaftCommand<S> {
     }
 }
 
+#[derive(Debug)]
+pub struct RaftCommandV2<S: Snapshot> {
+    pub send_time: Instant,
+    pub header: RaftRequestHeader,
+    pub data: Vec<u8>,
+    pub callback: Callback<S>,
+}
+
+impl<S: Snapshot> RaftCommandV2<S> {
+    #[inline]
+    pub fn new(
+        header: RaftRequestHeader,
+        data: Vec<u8>,
+        callback: Callback<S>,
+    ) -> RaftCommandV2<S> {
+        RaftCommandV2 {
+            header,
+            data,
+            callback,
+            send_time: Instant::now(),
+        }
+    }
+}
 /// Message that can be sent to a peer.
 pub enum PeerMsg<EK: KvEngine> {
     /// Raft message is the message sent between raft nodes in the same
@@ -426,6 +449,8 @@ pub enum PeerMsg<EK: KvEngine> {
     /// leader of the target raft group. If it's failed to be sent, callback
     /// usually needs to be called before dropping in case of resource leak.
     RaftCommand(RaftCommand<EK::Snapshot>),
+    /// Raft command V2 encode the kv pairs with a new format.
+    RaftCommandV2(RaftCommandV2<EK::Snapshot>),
     /// Tick is periodical task. If target peer doesn't exist there is a potential
     /// that the raft node will not work anymore.
     Tick(PeerTicks),
@@ -451,6 +476,7 @@ impl<EK: KvEngine> fmt::Debug for PeerMsg<EK> {
         match self {
             PeerMsg::RaftMessage(_) => write!(fmt, "Raft Message"),
             PeerMsg::RaftCommand(_) => write!(fmt, "Raft Command"),
+            PeerMsg::RaftCommandV2(_) => write!(fmt, "Raft Command V2"),
             PeerMsg::Tick(tick) => write! {
                 fmt,
                 "{:?}",

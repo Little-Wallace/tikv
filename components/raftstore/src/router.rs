@@ -4,7 +4,7 @@ use std::cell::RefCell;
 
 use crossbeam::{SendError, TrySendError};
 use engine_traits::{KvEngine, RaftEngine, Snapshot};
-use kvproto::raft_cmdpb::RaftCmdRequest;
+use kvproto::raft_cmdpb::{RaftCmdRequest, RaftRequestHeader};
 use kvproto::raft_serverpb::RaftMessage;
 use raft::SnapshotStatus;
 use tikv_util::time::ThreadReadId;
@@ -12,7 +12,8 @@ use tikv_util::time::ThreadReadId;
 use crate::store::fsm::RaftRouter;
 use crate::store::transport::{CasualRouter, ProposalRouter, StoreRouter};
 use crate::store::{
-    Callback, CasualMessage, LocalReader, PeerMsg, RaftCommand, SignificantMsg, StoreMsg,
+    Callback, CasualMessage, LocalReader, PeerMsg, RaftCommand, RaftCommandV2, SignificantMsg,
+    StoreMsg,
 };
 use crate::{DiscardReason, Error as RaftStoreError, Result as RaftStoreResult};
 
@@ -50,6 +51,18 @@ where
         let region_id = req.get_header().get_region_id();
         let cmd = RaftCommand::new(req, cb);
         <Self as ProposalRouter<EK::Snapshot>>::send(self, cmd)
+            .map_err(|e| handle_send_error(region_id, e))
+    }
+
+    fn send_command_v2(
+        &self,
+        header: RaftRequestHeader,
+        data: Vec<u8>,
+        cb: Callback<EK::Snapshot>,
+    ) -> RaftStoreResult<()> {
+        let region_id = header.get_region_id();
+        let cmd = RaftCommandV2::new(header, data, cb);
+        <Self as ProposalRouter<EK::Snapshot>>::send_v2(self, cmd)
             .map_err(|e| handle_send_error(region_id, e))
     }
 
@@ -115,6 +128,10 @@ impl<EK: KvEngine> CasualRouter<EK> for RaftStoreBlackHole {
 
 impl<S: Snapshot> ProposalRouter<S> for RaftStoreBlackHole {
     fn send(&self, _: RaftCommand<S>) -> std::result::Result<(), TrySendError<RaftCommand<S>>> {
+        Ok(())
+    }
+
+    fn send_v2(&self, _: RaftCommandV2<S>) -> Result<(), TrySendError<RaftCommandV2<S>>> {
         Ok(())
     }
 }
@@ -186,6 +203,13 @@ impl<EK: KvEngine, ER: RaftEngine> ProposalRouter<EK::Snapshot> for ServerRaftSt
         cmd: RaftCommand<EK::Snapshot>,
     ) -> std::result::Result<(), TrySendError<RaftCommand<EK::Snapshot>>> {
         ProposalRouter::send(&self.router, cmd)
+    }
+
+    fn send_v2(
+        &self,
+        cmd: RaftCommandV2<<EK as KvEngine>::Snapshot>,
+    ) -> Result<(), TrySendError<RaftCommandV2<<EK as KvEngine>::Snapshot>>> {
+        ProposalRouter::send_v2(&self.router, cmd)
     }
 }
 

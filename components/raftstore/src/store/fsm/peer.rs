@@ -19,8 +19,8 @@ use kvproto::import_sstpb::SstMeta;
 use kvproto::metapb::{self, Region, RegionEpoch};
 use kvproto::pdpb::CheckPolicy;
 use kvproto::raft_cmdpb::{
-    AdminCmdType, AdminRequest, CmdType, RaftCmdRequest, RaftCmdResponse, Request, StatusCmdType,
-    StatusResponse,
+    AdminCmdType, AdminRequest, CmdType, RaftCmdRequest, RaftCmdResponse, RaftRequestHeader,
+    Request, StatusCmdType, StatusResponse,
 };
 use kvproto::raft_serverpb::{
     ExtraMessage, ExtraMessageType, MergeState, PeerState, RaftMessage, RaftSnapshotData,
@@ -139,6 +139,7 @@ where
         while let Ok(msg) = self.receiver.try_recv() {
             let callback = match msg {
                 PeerMsg::RaftCommand(cmd) => cmd.callback,
+                PeerMsg::RaftCommandV2(cmd) => cmd.callback,
                 PeerMsg::CasualMessage(CasualMessage::SplitRegion { callback, .. }) => callback,
                 _ => continue,
             };
@@ -502,6 +503,14 @@ where
                         self.propose_batch_raft_command();
                         self.propose_raft_command(cmd.request, cmd.callback)
                     }
+                }
+                PeerMsg::RaftCommandV2(cmd) => {
+                    self.ctx
+                        .raft_metrics
+                        .propose
+                        .request_wait_time
+                        .observe(duration_to_sec(cmd.send_time.elapsed()) as f64);
+                    self.propose_raft_commandv2(cmd.header, cmd.data, cmd.callback);
                 }
                 PeerMsg::Tick(tick) => self.on_tick(tick),
                 PeerMsg::ApplyRes { res } => {
@@ -3172,9 +3181,6 @@ where
             return Ok(Some(resp));
         }
 
-        // Check whether the store has the right peer to handle the request.
-        let region_id = self.region_id();
-        let leader_id = self.fsm.peer.leader_id();
         let request = msg.get_requests();
 
         // ReadIndex can be processed on the replicas.
@@ -3188,6 +3194,34 @@ where
             }
         }
         let allow_replica_read = read_only && msg.get_header().get_replica_read();
+        self.check_raft_command(msg.get_header(), is_read_index_request, allow_replica_read)?;
+        match util::check_region_epoch(msg, self.fsm.peer.region(), true) {
+            Err(Error::EpochNotMatch(msg, mut new_regions)) => {
+                // Attach the region which might be split from the current region. But it doesn't
+                // matter if the region is not split from the current region. If the region meta
+                // received by the TiKV driver is newer than the meta cached in the driver, the meta is
+                // updated.
+                let sibling_region = self.find_sibling_region();
+                if let Some(sibling_region) = sibling_region {
+                    new_regions.push(sibling_region);
+                }
+                self.ctx.raft_metrics.invalid_proposal.epoch_not_match += 1;
+                Err(Error::EpochNotMatch(msg, new_regions))
+            }
+            Err(e) => Err(e),
+            Ok(()) => Ok(None),
+        }
+    }
+
+    fn check_raft_command(
+        &mut self,
+        header: &RaftRequestHeader,
+        is_read_index_request: bool,
+        allow_replica_read: bool,
+    ) -> Result<()> {
+        // Check whether the store has the right peer to handle the request.
+        let region_id = self.region_id();
+        let leader_id = self.fsm.peer.leader_id();
         if !(self.fsm.peer.is_leader() || is_read_index_request || allow_replica_read) {
             self.ctx.raft_metrics.invalid_proposal.not_leader += 1;
             let leader = self.fsm.peer.get_peer_from_cache(leader_id);
@@ -3196,7 +3230,7 @@ where
             return Err(Error::NotLeader(region_id, leader));
         }
         // peer_id must be the same as peer's.
-        if let Err(e) = util::check_peer_id(msg.get_header(), self.fsm.peer.peer_id()) {
+        if let Err(e) = util::check_peer_id(header, self.fsm.peer.peer_id()) {
             self.ctx.raft_metrics.invalid_proposal.mismatch_peer_id += 1;
             return Err(e);
         }
@@ -3219,27 +3253,11 @@ where
             )));
         }
         // Check whether the term is stale.
-        if let Err(e) = util::check_term(msg.get_header(), self.fsm.peer.term()) {
+        if let Err(e) = util::check_term(header, self.fsm.peer.term()) {
             self.ctx.raft_metrics.invalid_proposal.stale_command += 1;
             return Err(e);
         }
-
-        match util::check_region_epoch(msg, self.fsm.peer.region(), true) {
-            Err(Error::EpochNotMatch(msg, mut new_regions)) => {
-                // Attach the region which might be split from the current region. But it doesn't
-                // matter if the region is not split from the current region. If the region meta
-                // received by the TiKV driver is newer than the meta cached in the driver, the meta is
-                // updated.
-                let sibling_region = self.find_sibling_region();
-                if let Some(sibling_region) = sibling_region {
-                    new_regions.push(sibling_region);
-                }
-                self.ctx.raft_metrics.invalid_proposal.epoch_not_match += 1;
-                Err(Error::EpochNotMatch(msg, new_regions))
-            }
-            Err(e) => Err(e),
-            Ok(()) => Ok(None),
-        }
+        Ok(())
     }
 
     fn propose_raft_command(&mut self, mut msg: RaftCmdRequest, cb: Callback<EK::Snapshot>) {
@@ -3300,6 +3318,66 @@ where
 
         // TODO: add timeout, if the command is not applied after timeout,
         // we will call the callback with timeout error.
+    }
+
+    fn propose_raft_commandv2(
+        &mut self,
+        mut header: RaftRequestHeader,
+        data: Vec<u8>,
+        cb: Callback<EK::Snapshot>,
+    ) {
+        if let Err(e) = self.pre_propose_raft_command_v2(&header) {
+            debug!(
+                "failed to propose";
+                "region_id" => self.region_id(),
+                "peer_id" => self.fsm.peer_id(),
+                "message" => ?header,
+                "err" => %e,
+            );
+            cb.invoke_with_response(new_error(e));
+            return;
+        }
+        if self.fsm.peer.pending_remove {
+            apply::notify_req_region_removed(self.region_id(), cb);
+            return;
+        }
+        let mut resp = RaftCmdResponse::default();
+        let term = self.fsm.peer.term();
+        bind_term(&mut resp, term);
+        if self.fsm.peer.propose_v2(self.ctx, cb, header, data, resp) {
+            self.fsm.has_ready = true;
+        }
+        if self.fsm.peer.should_wake_up {
+            self.reset_raft_tick(GroupState::Ordered);
+        }
+        self.register_pd_heartbeat_tick();
+    }
+
+    fn pre_propose_raft_command_v2(&mut self, header: &RaftRequestHeader) -> Result<()> {
+        self.check_raft_command(&header, false, false)?;
+        let from_epoch = header.get_region_epoch();
+        match util::compare_region_epoch(
+            from_epoch,
+            self.fsm.peer.region(),
+            util::NORMAL_REQ_CHECK_CONF_VER,
+            util::NORMAL_REQ_CHECK_VER,
+            true,
+        ) {
+            Err(Error::EpochNotMatch(msg, mut new_regions)) => {
+                // Attach the region which might be split from the current region. But it doesn't
+                // matter if the region is not split from the current region. If the region meta
+                // received by the TiKV driver is newer than the meta cached in the driver, the meta is
+                // updated.
+                let sibling_region = self.find_sibling_region();
+                if let Some(sibling_region) = sibling_region {
+                    new_regions.push(sibling_region);
+                }
+                self.ctx.raft_metrics.invalid_proposal.epoch_not_match += 1;
+                Err(Error::EpochNotMatch(msg, new_regions))
+            }
+            Err(e) => Err(e),
+            Ok(()) => Ok(()),
+        }
     }
 
     fn find_sibling_region(&self) -> Option<Region> {

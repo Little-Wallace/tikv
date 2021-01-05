@@ -1,6 +1,6 @@
 // Copyright 2016 TiKV Project Authors. Licensed under Apache-2.0.
 
-use crate::store::{CasualMessage, PeerMsg, RaftCommand, RaftRouter, StoreMsg};
+use crate::store::{CasualMessage, PeerMsg, RaftCommand, RaftCommandV2, RaftRouter, StoreMsg};
 use crate::{DiscardReason, Error, Result};
 use crossbeam::TrySendError;
 use engine_traits::{KvEngine, RaftEngine, Snapshot};
@@ -32,6 +32,10 @@ where
     S: Snapshot,
 {
     fn send(&self, cmd: RaftCommand<S>) -> std::result::Result<(), TrySendError<RaftCommand<S>>>;
+    fn send_v2(
+        &self,
+        cmd: RaftCommandV2<S>,
+    ) -> std::result::Result<(), TrySendError<RaftCommandV2<S>>>;
 }
 
 /// Routes message to store FSM.
@@ -70,6 +74,21 @@ where
         cmd: RaftCommand<EK::Snapshot>,
     ) -> std::result::Result<(), TrySendError<RaftCommand<EK::Snapshot>>> {
         self.send_raft_command(cmd)
+    }
+
+    fn send_v2(
+        &self,
+        cmd: RaftCommandV2<EK::Snapshot>,
+    ) -> std::result::Result<(), TrySendError<RaftCommandV2<EK::Snapshot>>> {
+        let region_id = cmd.header.get_region_id();
+        match self.router.send(region_id, PeerMsg::RaftCommandV2(cmd)) {
+            Ok(()) => Ok(()),
+            Err(TrySendError::Full(PeerMsg::RaftCommandV2(cmd))) => Err(TrySendError::Full(cmd)),
+            Err(TrySendError::Disconnected(PeerMsg::RaftCommandV2(cmd))) => {
+                Err(TrySendError::Disconnected(cmd))
+            }
+            _ => unreachable!(),
+        }
     }
 }
 
@@ -112,6 +131,13 @@ impl<S: Snapshot> ProposalRouter<S> for mpsc::SyncSender<RaftCommand<S>> {
             Err(mpsc::TrySendError::Disconnected(cmd)) => Err(TrySendError::Disconnected(cmd)),
             Err(mpsc::TrySendError::Full(cmd)) => Err(TrySendError::Full(cmd)),
         }
+    }
+
+    fn send_v2(
+        &self,
+        _: RaftCommandV2<S>,
+    ) -> std::result::Result<(), TrySendError<RaftCommandV2<S>>> {
+        Ok(())
     }
 }
 

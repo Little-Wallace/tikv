@@ -315,6 +315,13 @@ pub mod test_router {
             let _ = self.tx.send(1);
             Ok(())
         }
+        fn send_v2(
+            &self,
+            _: RaftCommandV2<S>,
+        ) -> std::result::Result<(), crossbeam::channel::TrySendError<RaftCommandV2<S>>> {
+            let _ = self.tx.send(1);
+            Ok(())
+        }
     }
 
     impl<EK: KvEngine> CasualRouter<EK> for TestRaftStoreRouter {

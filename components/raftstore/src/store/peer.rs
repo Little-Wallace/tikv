@@ -15,7 +15,8 @@ use kvproto::metapb::{self, PeerRole};
 use kvproto::pdpb::PeerStats;
 use kvproto::raft_cmdpb::{
     self, AdminCmdType, AdminResponse, ChangePeerRequest, CmdType, CommitMergeRequest,
-    RaftCmdRequest, RaftCmdResponse, TransferLeaderRequest, TransferLeaderResponse,
+    RaftCmdRequest, RaftCmdResponse, RaftRequestHeader, TransferLeaderRequest,
+    TransferLeaderResponse,
 };
 use kvproto::raft_serverpb::{
     ExtraMessage, ExtraMessageType, MergeState, PeerState, RaftApplyState, RaftMessage,
@@ -2162,36 +2163,101 @@ where
                 false
             }
             Ok(Either::Left(idx)) => {
-                let has_applied_to_current_term = self.has_applied_to_current_term();
-                if has_applied_to_current_term {
-                    // After this peer has applied to current term and passed above checking including `cmd_epoch_checker`,
-                    // we can safely guarantee that this proposal will be committed if there is no abnormal leader transfer
-                    // in the near future. Thus proposed callback can be called.
-                    cb.invoke_proposed();
-                }
-                if is_urgent {
-                    self.last_urgent_proposal_idx = idx;
-                    // Eager flush to make urgent proposal be applied on all nodes as soon as
-                    // possible.
-                    self.raft_group.skip_bcast_commit(false);
-                }
-                self.should_wake_up = true;
-                let p = Proposal {
-                    is_conf_change: req_admin_cmd_type == Some(AdminCmdType::ChangePeer),
-                    index: idx,
-                    term: self.term(),
-                    cb,
-                    renew_lease_time: None,
-                    must_pass_epoch_check: has_applied_to_current_term,
-                };
-                if let Some(cmd_type) = req_admin_cmd_type {
-                    self.cmd_epoch_checker
-                        .post_propose(cmd_type, idx, self.term());
-                }
-                self.post_propose(ctx, p);
+                self.handle_propose_index(ctx, idx, is_urgent, req_admin_cmd_type, cb);
                 true
             }
         }
+    }
+    /// Propose a request.
+    ///
+    /// Return true means the request has been proposed successfully.
+    pub fn propose_v2<T: Transport>(
+        &mut self,
+        ctx: &mut PollContext<EK, ER, T>,
+        mut cb: Callback<EK::Snapshot>,
+        header: RaftRequestHeader,
+        data: Vec<u8>,
+        mut err_resp: RaftCmdResponse,
+    ) -> bool {
+        if self.pending_remove {
+            return false;
+        }
+        ctx.raft_metrics.propose.all += 1;
+        if self.has_applied_to_current_term() {
+            // Only when applied index's term is equal to current leader's term, the information
+            // in epoch checker is up to date and can be used to check epoch.
+            if let Some(index) = self
+                .cmd_epoch_checker
+                .last_conflict_index(NORMAL_REQ_CHECK_VER, NORMAL_REQ_CHECK_CONF_VER)
+            {
+                if !cb.is_none() {
+                    self.cmd_epoch_checker.attach_to_conflict_cmd(index, cb);
+                }
+                return false;
+            }
+        }
+
+        let mut pctx = ProposalContext::empty();
+        if header.get_sync_log() {
+            pctx.insert(ProposalContext::SYNC_LOG);
+        }
+        let propose_index = self.next_proposal_index();
+        let edata = util::encode_entry_data(header.get_region_epoch(), &data);
+        if let Err(e) = self.raft_group.propose(pctx.to_vec(), edata) {
+            cmd_resp::bind_error(&mut err_resp, e.into());
+            cb.invoke_with_response(err_resp);
+            return false;
+        }
+        if self.next_proposal_index() == propose_index {
+            // The message is dropped silently, this usually due to leader absence
+            // or transferring leader. Both cases can be considered as NotLeader error.
+            cmd_resp::bind_error(&mut err_resp, Error::NotLeader(self.region_id, None));
+            cb.invoke_with_response(err_resp);
+            return false;
+        }
+
+        if pctx.contains(ProposalContext::PREPARE_MERGE) {
+            self.last_proposed_prepare_merge_idx = propose_index;
+        }
+        self.handle_propose_index(ctx, propose_index, false, None, cb);
+        true
+    }
+
+    fn handle_propose_index<T: Transport>(
+        &mut self,
+        ctx: &mut PollContext<EK, ER, T>,
+        idx: u64,
+        is_urgent: bool,
+        req_admin_cmd_type: Option<AdminCmdType>,
+        mut cb: Callback<EK::Snapshot>,
+    ) {
+        let has_applied_to_current_term = self.has_applied_to_current_term();
+        if has_applied_to_current_term {
+            // After this peer has applied to current term and passed above checking including `cmd_epoch_checker`,
+            // we can safely guarantee that this proposal will be committed if there is no abnormal leader transfer
+            // in the near future. Thus proposed callback can be called.
+            cb.invoke_proposed();
+        }
+        if is_urgent {
+            self.last_urgent_proposal_idx = idx;
+            // Eager flush to make urgent proposal be applied on all nodes as soon as
+            // possible.
+            self.raft_group.skip_bcast_commit(false);
+        }
+        self.should_wake_up = true;
+        let p = Proposal {
+            is_conf_change: req_admin_cmd_type == Some(AdminCmdType::ChangePeer),
+            index: idx,
+            term: self.term(),
+            cb,
+            renew_lease_time: None,
+            must_pass_epoch_check: has_applied_to_current_term,
+        };
+        if let Some(cmd_type) = req_admin_cmd_type {
+            self.cmd_epoch_checker
+                .post_propose(cmd_type, idx, self.term());
+        }
+        self.post_propose(ctx, p);
     }
 
     fn post_propose<T>(

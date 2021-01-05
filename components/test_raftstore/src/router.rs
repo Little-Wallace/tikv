@@ -9,7 +9,9 @@ use kvproto::raft_serverpb::RaftMessage;
 use raftstore::errors::{Error as RaftStoreError, Result as RaftStoreResult};
 use raftstore::router::{handle_send_error, RaftStoreRouter};
 use raftstore::store::msg::{CasualMessage, PeerMsg, SignificantMsg};
-use raftstore::store::{CasualRouter, ProposalRouter, RaftCommand, StoreMsg, StoreRouter};
+use raftstore::store::{
+    CasualRouter, ProposalRouter, RaftCommand, RaftCommandV2, StoreMsg, StoreRouter,
+};
 use tikv_util::mpsc::{loose_bounded, LooseBoundedSender, Receiver};
 
 #[derive(Clone)]
@@ -43,6 +45,13 @@ impl ProposalRouter<RocksSnapshot> for MockRaftStoreRouter {
         _: RaftCommand<RocksSnapshot>,
     ) -> std::result::Result<(), TrySendError<RaftCommand<RocksSnapshot>>> {
         unimplemented!();
+    }
+
+    fn send_v2(
+        &self,
+        _: RaftCommandV2<RocksSnapshot>,
+    ) -> Result<(), TrySendError<RaftCommandV2<RocksSnapshot>>> {
+        unimplemented!()
     }
 }
 

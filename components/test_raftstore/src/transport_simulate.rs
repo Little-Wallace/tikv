@@ -15,8 +15,8 @@ use kvproto::raft_serverpb::RaftMessage;
 use raft::eraftpb::MessageType;
 use raftstore::router::{LocalReadRouter, RaftStoreRouter};
 use raftstore::store::{
-    Callback, CasualMessage, CasualRouter, PeerMsg, ProposalRouter, RaftCommand, SignificantMsg,
-    StoreMsg, StoreRouter, Transport,
+    Callback, CasualMessage, CasualRouter, PeerMsg, ProposalRouter, RaftCommand, RaftCommandV2,
+    SignificantMsg, StoreMsg, StoreRouter, Transport,
 };
 use raftstore::Result as RaftStoreResult;
 use raftstore::{DiscardReason, Error, Result};
@@ -221,6 +221,13 @@ impl<C: RaftStoreRouter<RocksEngine>> ProposalRouter<RocksSnapshot> for Simulate
         cmd: RaftCommand<RocksSnapshot>,
     ) -> std::result::Result<(), TrySendError<RaftCommand<RocksSnapshot>>> {
         ProposalRouter::<RocksSnapshot>::send(&self.ch, cmd)
+    }
+
+    fn send_v2(
+        &self,
+        cmd: RaftCommandV2<RocksSnapshot>,
+    ) -> std::result::Result<(), TrySendError<RaftCommandV2<RocksSnapshot>>> {
+        ProposalRouter::<RocksSnapshot>::send_v2(&self.ch, cmd)
     }
 }
 

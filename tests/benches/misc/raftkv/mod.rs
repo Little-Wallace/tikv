@@ -13,7 +13,8 @@ use kvproto::raft_serverpb::RaftMessage;
 use raftstore::router::{LocalReadRouter, RaftStoreRouter};
 use raftstore::store::{
     cmd_resp, util, Callback, CasualMessage, CasualRouter, PeerMsg, ProposalRouter, RaftCommand,
-    ReadResponse, RegionSnapshot, SignificantMsg, StoreMsg, StoreRouter, WriteResponse,
+    RaftCommandV2, ReadResponse, RegionSnapshot, SignificantMsg, StoreMsg, StoreRouter,
+    WriteResponse,
 };
 use raftstore::Result;
 use tempfile::{Builder, TempDir};
@@ -79,6 +80,13 @@ impl ProposalRouter<RocksSnapshot> for SyncBenchRouter {
         &self,
         _: RaftCommand<RocksSnapshot>,
     ) -> std::result::Result<(), TrySendError<RaftCommand<RocksSnapshot>>> {
+        Ok(())
+    }
+
+    fn send_v2(
+        &self,
+        _: RaftCommandV2<RocksSnapshot>,
+    ) -> std::result::Result<(), TrySendError<RaftCommandV2<RocksSnapshot>>> {
         Ok(())
     }
 }
