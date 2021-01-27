@@ -81,12 +81,15 @@ use std::{
     iter,
     sync::{atomic, Arc},
 };
-use tikv_util::time::Instant;
 use tikv_util::time::ThreadReadId;
+use tikv_util::time::{Duration, Instant};
 use txn_types::{Key, KvPair, Lock, TimeStamp, TsSet, Value};
+use yatp::task::future::reschedule;
 
 pub type Result<T> = std::result::Result<T, Error>;
 pub type Callback<T> = Box<dyn FnOnce(Result<T>) + Send>;
+pub const BATCH_MAX_SIZE: usize = 1024;
+pub const MAX_TIME_SLICE: Duration = Duration::from_millis(1);
 
 /// [`Storage`](Storage) implements transactional KV APIs and raw KV APIs on a given [`Engine`].
 /// An [`Engine`] provides low level KV functionality. [`Engine`] has multiple implementations.
@@ -1120,7 +1123,7 @@ impl<E: Engine, L: LockManager> Storage<E, L> {
     ///
     /// If `key_only` is true, the value corresponding to the key will not be read. Only scanned
     /// keys will be returned.
-    fn forward_raw_scan(
+    async fn forward_raw_scan(
         snapshot: &E::Snap,
         cf: &str,
         start_key: &Key,
@@ -1142,6 +1145,7 @@ impl<E: Engine, L: LockManager> Storage<E, L> {
             return Ok(vec![]);
         }
         let mut pairs = vec![];
+        let mut time_slice_start = Instant::now();
         while cursor.valid()? && pairs.len() < limit {
             pairs.push(Ok((
                 cursor.key(statistics).to_owned(),
@@ -1151,6 +1155,12 @@ impl<E: Engine, L: LockManager> Storage<E, L> {
                     cursor.value(statistics).to_owned()
                 },
             )));
+            if pairs.len() % BATCH_MAX_SIZE == 0 {
+                if time_slice_start.elapsed() > MAX_TIME_SLICE {
+                    reschedule().await;
+                    time_slice_start = Instant::now();
+                }
+            }
             cursor.next(statistics);
         }
         Ok(pairs)
@@ -1161,7 +1171,7 @@ impl<E: Engine, L: LockManager> Storage<E, L> {
     ///
     /// If `key_only` is true, the value
     /// corresponding to the key will not be read out. Only scanned keys will be returned.
-    fn reverse_raw_scan(
+    async fn reverse_raw_scan(
         snapshot: &E::Snap,
         cf: &str,
         start_key: &Key,
@@ -1183,6 +1193,7 @@ impl<E: Engine, L: LockManager> Storage<E, L> {
             return Ok(vec![]);
         }
         let mut pairs = vec![];
+        let mut time_slice_start = Instant::now();
         while cursor.valid()? && pairs.len() < limit {
             pairs.push(Ok((
                 cursor.key(statistics).to_owned(),
@@ -1192,6 +1203,12 @@ impl<E: Engine, L: LockManager> Storage<E, L> {
                     cursor.value(statistics).to_owned()
                 },
             )));
+            if pairs.len() % BATCH_MAX_SIZE == 0 {
+                if time_slice_start.elapsed() > MAX_TIME_SLICE {
+                    reschedule().await;
+                    time_slice_start = Instant::now();
+                }
+            }
             cursor.prev(statistics);
         }
         Ok(pairs)
@@ -1265,6 +1282,7 @@ impl<E: Engine, L: LockManager> Storage<E, L> {
                             &mut statistics,
                             key_only,
                         )
+                        .await
                         .map_err(Error::from)
                     } else {
                         Self::forward_raw_scan(
@@ -1276,6 +1294,7 @@ impl<E: Engine, L: LockManager> Storage<E, L> {
                             &mut statistics,
                             key_only,
                         )
+                        .await
                         .map_err(Error::from)
                     };
 
@@ -1396,7 +1415,8 @@ impl<E: Engine, L: LockManager> Storage<E, L> {
                                 each_limit,
                                 &mut statistics,
                                 key_only,
-                            )?
+                            )
+                            .await?
                         } else {
                             Self::forward_raw_scan(
                                 &snapshot,
@@ -1406,7 +1426,8 @@ impl<E: Engine, L: LockManager> Storage<E, L> {
                                 each_limit,
                                 &mut statistics,
                                 key_only,
-                            )?
+                            )
+                            .await?
                         };
                         result.extend(pairs.into_iter());
                     }
@@ -3647,6 +3668,7 @@ mod tests {
                     &mut Statistics::default(),
                     false,
                 )
+                .await
             })
             .unwrap(),
         );
@@ -3667,6 +3689,7 @@ mod tests {
                     &mut Statistics::default(),
                     false,
                 )
+                .await
             })
             .unwrap(),
         );
