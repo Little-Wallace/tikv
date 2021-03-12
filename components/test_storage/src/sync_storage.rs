@@ -332,4 +332,36 @@ impl<E: Engine> SyncTestStorage<E> {
                 .raw_scan(ctx, cf, start_key, end_key, limit, false, true),
         )
     }
+
+    pub fn raw_compare_and_set_atomic(
+        &self,
+        ctx: Context,
+        cf: String,
+        key: Vec<u8>,
+        previous_value: Vec<u8>,
+        value: Vec<u8>,
+    ) -> Result<Option<Vec<u8>>> {
+        wait_op!(|cb| self.store.raw_compare_and_set_atomic(
+            ctx,
+            cf,
+            key,
+            previous_value,
+            value,
+            cb
+        ))
+        .unwrap()
+    }
+
+    pub fn raw_batch_put_atomic(&self, ctx: Context, cf: String, pairs: Vec<KvPair>) -> Result<()> {
+        wait_op!(|cb| self.store.raw_batch_put_atomic(ctx, cf, pairs, cb)).unwrap()
+    }
+
+    pub fn raw_batch_delete_atomic(
+        &self,
+        ctx: Context,
+        cf: String,
+        keys: Vec<Vec<u8>>,
+    ) -> Result<()> {
+        wait_op!(|cb| self.store.raw_batch_delete_atomic(ctx, cf, keys, cb)).unwrap()
+    }
 }
