@@ -18,15 +18,17 @@ pub struct ReqBatcher {
     raw_gets: Vec<RawGetRequest>,
     get_ids: Vec<u64>,
     raw_get_ids: Vec<u64>,
+    begin_instant: Instant,
 }
 
 impl ReqBatcher {
-    pub fn new() -> ReqBatcher {
+    pub fn new(begin_instant: Instant) -> ReqBatcher {
         ReqBatcher {
             gets: vec![],
             raw_gets: vec![],
             get_ids: vec![],
             raw_get_ids: vec![],
+            begin_instant,
         }
     }
 
@@ -51,34 +53,40 @@ impl ReqBatcher {
     pub fn maybe_commit<E: Engine, L: LockManager>(
         &mut self,
         storage: &Storage<E, L>,
-        tx: &Sender<(u64, batch_commands_response::Response)>,
+        tx: &Sender<(u64, Instant, batch_commands_response::Response)>,
     ) {
         if self.gets.len() > 10 {
             let gets = std::mem::replace(&mut self.gets, vec![]);
             let ids = std::mem::replace(&mut self.get_ids, vec![]);
-            future_batch_get_command(storage, ids, gets, tx.clone());
+            future_batch_get_command(storage, ids, gets, self.begin_instant.clone(), tx.clone());
         }
         if self.raw_gets.len() > 16 {
             let gets = std::mem::replace(&mut self.raw_gets, vec![]);
             let ids = std::mem::replace(&mut self.raw_get_ids, vec![]);
-            future_batch_raw_get_command(storage, ids, gets, tx.clone());
+            future_batch_raw_get_command(
+                storage,
+                ids,
+                gets,
+                self.begin_instant.clone(),
+                tx.clone(),
+            );
         }
     }
 
     pub fn commit<E: Engine, L: LockManager>(
-        &mut self,
+        self,
         storage: &Storage<E, L>,
-        tx: &Sender<(u64, batch_commands_response::Response)>,
+        tx: &Sender<(u64, Instant, batch_commands_response::Response)>,
     ) {
         if !self.gets.is_empty() {
-            let gets = std::mem::replace(&mut self.gets, vec![]);
-            let ids = std::mem::replace(&mut self.get_ids, vec![]);
-            future_batch_get_command(storage, ids, gets, tx.clone());
+            let gets = self.gets;
+            let ids = self.get_ids;
+            future_batch_get_command(storage, ids, gets, self.begin_instant, tx.clone());
         }
         if !self.raw_gets.is_empty() {
-            let gets = std::mem::replace(&mut self.raw_gets, vec![]);
-            let ids = std::mem::replace(&mut self.raw_get_ids, vec![]);
-            future_batch_raw_get_command(storage, ids, gets, tx.clone());
+            let gets = self.raw_gets;
+            let ids = self.raw_get_ids;
+            future_batch_raw_get_command(storage, ids, gets, self.begin_instant, tx.clone());
         }
     }
 }
@@ -87,13 +95,16 @@ fn future_batch_get_command<E: Engine, L: LockManager>(
     storage: &Storage<E, L>,
     requests: Vec<u64>,
     gets: Vec<GetRequest>,
-    tx: Sender<(u64, batch_commands_response::Response)>,
+    begin_instant: Instant,
+    tx: Sender<(u64, Instant, batch_commands_response::Response)>,
 ) {
-    let begin_instant = Instant::now_coarse();
     let ret = storage.batch_get_command(gets);
     let f = async move {
         match ret.await {
             Ok(ret) => {
+                GRPC_MSG_HISTOGRAM_STATIC
+                    .kv_batch_get_command
+                    .observe(begin_instant.elapsed_secs());
                 for (v, req) in ret.into_iter().zip(requests) {
                     let mut resp = GetResponse::default();
                     if let Some(err) = extract_region_error(&v) {
@@ -117,7 +128,7 @@ fn future_batch_get_command<E: Engine, L: LockManager>(
                         cmd: Some(batch_commands_response::response::Cmd::Get(resp)),
                         ..Default::default()
                     };
-                    if tx.send_and_notify((req, res)).is_err() {
+                    if tx.send_and_notify((req, begin_instant, res)).is_err() {
                         error!("KvService response batch commands fail");
                     }
                 }
@@ -134,15 +145,15 @@ fn future_batch_get_command<E: Engine, L: LockManager>(
                     ..Default::default()
                 };
                 for req in requests {
-                    if tx.send_and_notify((req, res.clone())).is_err() {
+                    if tx
+                        .send_and_notify((req, begin_instant, res.clone()))
+                        .is_err()
+                    {
                         error!("KvService response batch commands fail");
                     }
                 }
             }
         }
-        GRPC_MSG_HISTOGRAM_STATIC
-            .kv_batch_get_command
-            .observe(begin_instant.elapsed_secs());
     };
     poll_future_notify(f);
 }
@@ -151,13 +162,16 @@ fn future_batch_raw_get_command<E: Engine, L: LockManager>(
     storage: &Storage<E, L>,
     requests: Vec<u64>,
     gets: Vec<RawGetRequest>,
-    tx: Sender<(u64, batch_commands_response::Response)>,
+    begin_instant: Instant,
+    tx: Sender<(u64, Instant, batch_commands_response::Response)>,
 ) {
-    let begin_instant = Instant::now_coarse();
     let ret = storage.raw_batch_get_command(gets);
     let f = async move {
         match ret.await {
             Ok(v) => {
+                GRPC_MSG_HISTOGRAM_STATIC
+                    .raw_batch_get_command
+                    .observe(duration_to_sec(begin_instant.elapsed()));
                 if requests.len() != v.len() {
                     error!("KvService batch response size mismatch");
                 }
@@ -176,7 +190,7 @@ fn future_batch_raw_get_command<E: Engine, L: LockManager>(
                         cmd: Some(batch_commands_response::response::Cmd::RawGet(resp)),
                         ..Default::default()
                     };
-                    if tx.send_and_notify((req, res)).is_err() {
+                    if tx.send_and_notify((req, begin_instant, res)).is_err() {
                         error!("KvService response batch commands fail");
                     }
                 }
@@ -193,15 +207,15 @@ fn future_batch_raw_get_command<E: Engine, L: LockManager>(
                     ..Default::default()
                 };
                 for req in requests {
-                    if tx.send_and_notify((req, res.clone())).is_err() {
+                    if tx
+                        .send_and_notify((req, begin_instant, res.clone()))
+                        .is_err()
+                    {
                         error!("KvService response batch commands fail");
                     }
                 }
             }
         }
-        GRPC_MSG_HISTOGRAM_STATIC
-            .raw_batch_get_command
-            .observe(duration_to_sec(begin_instant.elapsed()));
     };
     poll_future_notify(f);
 }
