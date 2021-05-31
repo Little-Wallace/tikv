@@ -6,6 +6,7 @@ use std::sync::{Arc, Mutex};
 
 use collections::HashSet;
 
+use super::make_rpc_error;
 use engine_traits::{name_to_cf, KvEngine, CF_WRITE};
 use file_system::{set_io_type, IOType};
 use futures::executor::{ThreadPool, ThreadPoolBuilder};
@@ -19,14 +20,13 @@ use kvproto::import_sstpb::write_request::*;
 use kvproto::import_sstpb::WriteRequest_oneof_chunk as Chunk;
 use kvproto::import_sstpb::*;
 
-use kvproto::kvrpcpb::Context;
 use kvproto::raft_cmdpb::*;
 
 use crate::server::CONFIG_ROCKSDB_GAUGE;
 use engine_traits::{SstExt, SstWriterBuilder};
 use raftstore::router::RaftStoreRouter;
 use raftstore::store::Callback;
-use sst_importer::send_rpc_response;
+
 use tikv_util::future::create_stream_with_buffer;
 use tikv_util::future::paired_future_callback;
 use tikv_util::time::{Instant, Limiter};
@@ -229,7 +229,7 @@ where
 
         let task = async move {
             let res = Ok(SwitchModeResponse::default());
-            send_rpc_response!(res, sink, label, timer);
+            crate::send_rpc_response!(res, sink, label, timer);
         };
         ctx.spawn(task);
     }
@@ -271,7 +271,7 @@ where
                 file.finish().map(|_| UploadResponse::default())
             }
             .await;
-            send_rpc_response!(res, sink, label, timer);
+            crate::send_rpc_response!(res, sink, label, timer);
         };
 
         self.threads.spawn_ok(buf_driver);
@@ -328,7 +328,7 @@ where
                 Err(e) => resp.set_error(e.into()),
             }
             let resp = Ok(resp);
-            send_rpc_response!(resp, sink, label, timer);
+            crate::send_rpc_response!(resp, sink, label, timer);
         };
 
         self.threads.spawn_ok(handle_task);
@@ -375,7 +375,7 @@ where
         let handle_task = async move {
             let res = f.await;
             Self::release_lock(&task_slots, &meta).unwrap();
-            send_rpc_response!(res, sink, label, timer);
+            crate::send_rpc_response!(res, sink, label, timer);
         };
         self.threads.spawn_ok(handle_task);
     }
@@ -427,7 +427,7 @@ where
             for m in metas {
                 Self::release_lock(&task_slots, &m).unwrap();
             }
-            send_rpc_response!(res, sink, label, timer);
+            crate::send_rpc_response!(res, sink, label, timer);
         };
         self.threads.spawn_ok(handle_task);
     }
@@ -475,7 +475,7 @@ where
             let res = res
                 .map_err(|e| Error::Engine(box_err!(e)))
                 .map(|_| CompactResponse::default());
-            send_rpc_response!(res, sink, label, timer);
+            crate::send_rpc_response!(res, sink, label, timer);
         };
 
         self.threads.spawn_ok(handle_task);
@@ -499,7 +499,7 @@ where
 
         let ctx_task = async move {
             let res = Ok(SetDownloadSpeedLimitResponse::default());
-            send_rpc_response!(res, sink, label, timer);
+            crate::send_rpc_response!(res, sink, label, timer);
         };
 
         ctx.spawn(ctx_task);
@@ -556,7 +556,7 @@ where
                 })
             }
             .await;
-            send_rpc_response!(res, sink, label, timer);
+            crate::send_rpc_response!(res, sink, label, timer);
         };
 
         self.threads.spawn_ok(buf_driver);

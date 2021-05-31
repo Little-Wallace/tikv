@@ -174,7 +174,7 @@ dependencies = [
  "fail",
  "futures 0.3.8",
  "futures-util",
- "grpcio",
+ "grpcio 0.9.0",
  "http",
  "hyper",
  "hyper-tls",
@@ -231,7 +231,7 @@ dependencies = [
  "file_system",
  "futures 0.3.8",
  "futures-util",
- "grpcio",
+ "grpcio 0.9.0",
  "hex 0.4.2",
  "keys",
  "kvproto",
@@ -385,6 +385,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "boringssl-src"
+version = "0.3.0+688fc5c"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f901accdf830d2ea2f4e27f923a5e1125cd8b1a39ab578b9db1a42d578a6922b"
+dependencies = [
+ "cmake",
+]
+
+[[package]]
 name = "bstr"
 version = "0.2.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -503,7 +512,7 @@ dependencies = [
  "fail",
  "futures 0.3.8",
  "futures-timer",
- "grpcio",
+ "grpcio 0.9.0",
  "kvproto",
  "lazy_static",
  "log_wrappers",
@@ -637,9 +646,9 @@ dependencies = [
 
 [[package]]
 name = "cmake"
-version = "0.1.42"
+version = "0.1.45"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "81fb25b677f8bf1eb325017cb6bb8452f87969db0fedb4f757b297bee78a7c62"
+checksum = "eb6210b637171dfba4cda12e579ac6dc73f5165ad56133e5d72ef3131f320855"
 dependencies = [
  "cc",
 ]
@@ -1315,7 +1324,7 @@ dependencies = [
 name = "error_code"
 version = "0.0.1"
 dependencies = [
- "grpcio",
+ "grpcio 0.9.0",
  "kvproto",
  "lazy_static",
  "raft",
@@ -1344,7 +1353,7 @@ dependencies = [
  "futures-executor",
  "futures-io",
  "futures-util",
- "grpcio",
+ "grpcio 0.9.0",
  "kvproto",
  "lazy_static",
  "libloading",
@@ -1382,7 +1391,7 @@ dependencies = [
  "futures-io",
  "futures-util",
  "gcp",
- "grpcio",
+ "grpcio 0.8.3",
  "kvproto",
  "lazy_static",
  "libc 0.2.86",
@@ -1838,13 +1847,29 @@ dependencies = [
 
 [[package]]
 name = "grpcio"
-version = "0.8.2"
+version = "0.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "397c5a9f569ba6beabec1e5b0b622d5e182913de45480666ae76849dd7ac01c9"
+checksum = "99cf790272c5fb75a2fd7f2e8282e910d0fe0ed1d954cb29b07b74228694302a"
 dependencies = [
  "bytes 1.0.1",
  "futures 0.3.8",
- "grpcio-sys",
+ "grpcio-sys 0.8.1",
+ "libc 0.2.86",
+ "log",
+ "parking_lot 0.11.0",
+ "prost",
+ "protobuf",
+]
+
+[[package]]
+name = "grpcio"
+version = "0.9.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2a1b8dd4e79b81ccfd5b9282dfc6d3d4e97568291c383c1bc98756a0f21e39d9"
+dependencies = [
+ "bytes 1.0.1",
+ "futures 0.3.8",
+ "grpcio-sys 0.9.0+1.38.0",
  "libc 0.2.86",
  "log",
  "parking_lot 0.11.0",
@@ -1868,12 +1893,12 @@ dependencies = [
 
 [[package]]
 name = "grpcio-health"
-version = "0.8.0"
+version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "62390e02d912a4cda2d93c500f3d3ce29ef5fc1c0501e89c61c8d005e5a3f3e3"
+checksum = "43439654c23bb8d2150f5a4853d8dc9390f76a3cac49c892e4f32265998dbaad"
 dependencies = [
  "futures 0.3.8",
- "grpcio",
+ "grpcio 0.9.0",
  "log",
  "prost",
  "protobuf",
@@ -1885,8 +1910,24 @@ version = "0.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1f89a56d830be4dddc939c377c95e3b77e30c86a8df99c20095c34cf9038447b"
 dependencies = [
+ "boringssl-src 0.2.0",
+ "cc",
+ "cmake",
+ "libc 0.2.86",
+ "libz-sys",
+ "openssl-sys",
+ "pkg-config",
+ "walkdir",
+]
+
+[[package]]
+name = "grpcio-sys"
+version = "0.9.0+1.38.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0cdbbb3010823156c3153b75db391c0f47beeec57353a33dfa38126b265cc1d5"
+dependencies = [
  "bindgen",
- "boringssl-src",
+ "boringssl-src 0.3.0+688fc5c",
  "cc",
  "cmake",
  "libc 0.2.86",
@@ -2244,7 +2285,7 @@ version = "0.0.2"
 source = "git+https://github.com/pingcap/kvproto.git?rev=f11c6fb6b3a53b214ee94d54651b01eb99239334#f11c6fb6b3a53b214ee94d54651b01eb99239334"
 dependencies = [
  "futures 0.3.8",
- "grpcio",
+ "grpcio 0.9.0",
  "lazy_static",
  "prost",
  "prost-derive",
@@ -2351,9 +2392,9 @@ dependencies = [
 
 [[package]]
 name = "libz-sys"
-version = "1.1.2"
+version = "1.1.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "602113192b08db8f38796c4e85c39e960c145965140e918018bcde1952429655"
+checksum = "de5435b8549c16d423ed0c03dbaafe57cf6c3344744f1242520d59c9d8ecec66"
 dependencies = [
  "cc",
  "libc 0.2.86",
@@ -3051,7 +3092,7 @@ dependencies = [
  "error_code",
  "fail",
  "futures 0.3.8",
- "grpcio",
+ "grpcio 0.9.0",
  "kvproto",
  "lazy_static",
  "log",
@@ -3946,7 +3987,7 @@ dependencies = [
  "engine_traits",
  "fail",
  "futures 0.3.8",
- "grpcio",
+ "grpcio 0.9.0",
  "hex 0.4.2",
  "kvproto",
  "lazy_static",
@@ -4253,7 +4294,7 @@ version = "0.0.1"
 dependencies = [
  "collections",
  "encryption",
- "grpcio",
+ "grpcio 0.9.0",
  "serde",
  "serde_derive",
  "serde_json",
@@ -4427,7 +4468,7 @@ dependencies = [
  "file_system",
  "fs2",
  "futures 0.3.8",
- "grpcio",
+ "grpcio 0.9.0",
  "hex 0.4.2",
  "keys",
  "kvproto",
@@ -4627,7 +4668,6 @@ dependencies = [
  "file_system",
  "futures 0.3.8",
  "futures-util",
- "grpcio",
  "keys",
  "kvproto",
  "lazy_static",
@@ -4963,7 +5003,7 @@ dependencies = [
  "futures 0.3.8",
  "futures-executor",
  "futures-util",
- "grpcio",
+ "grpcio 0.9.0",
  "kvproto",
  "rand 0.7.3",
  "tempfile",
@@ -5000,7 +5040,7 @@ dependencies = [
  "collections",
  "fail",
  "futures 0.3.8",
- "grpcio",
+ "grpcio 0.9.0",
  "kvproto",
  "pd_client",
  "security",
@@ -5022,7 +5062,7 @@ dependencies = [
  "fail",
  "file_system",
  "futures 0.3.8",
- "grpcio",
+ "grpcio 0.9.0",
  "keys",
  "kvproto",
  "lazy_static",
@@ -5079,7 +5119,7 @@ dependencies = [
  "collections",
  "encryption_export",
  "fail",
- "grpcio",
+ "grpcio 0.9.0",
  "kvproto",
  "rand 0.7.3",
  "rand_isaac",
@@ -5115,7 +5155,7 @@ dependencies = [
  "fail",
  "file_system",
  "futures 0.3.8",
- "grpcio",
+ "grpcio 0.9.0",
  "grpcio-health",
  "hyper",
  "keys",
@@ -5384,7 +5424,7 @@ dependencies = [
  "futures 0.3.8",
  "futures-executor",
  "futures-util",
- "grpcio",
+ "grpcio 0.9.0",
  "grpcio-health",
  "hex 0.4.2",
  "http",
@@ -5481,7 +5521,7 @@ dependencies = [
  "file_system",
  "fs2",
  "futures 0.3.8",
- "grpcio",
+ "grpcio 0.9.0",
  "hex 0.4.2",
  "keys",
  "kvproto",
@@ -5625,7 +5665,7 @@ dependencies = [
  "futures 0.3.8",
  "futures-util",
  "gag",
- "grpcio",
+ "grpcio 0.9.0",
  "http",
  "kvproto",
  "lazy_static",

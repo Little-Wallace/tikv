@@ -9,7 +9,6 @@ use std::result;
 use encryption::Error as EncryptionError;
 use error_code::{self, ErrorCode, ErrorCodeExt};
 use futures::channel::oneshot::Canceled;
-use grpcio::Error as GrpcError;
 use kvproto::import_sstpb;
 use tikv_util::codec::Error as CodecError;
 use uuid::Error as UuidError;
@@ -19,7 +18,6 @@ use crate::metrics::*;
 pub fn error_inc(type_: &str, err: &Error) {
     let label = match err {
         Error::Io(..) => "io",
-        Error::Grpc(..) => "grpc",
         Error::Uuid(..) => "uuid",
         Error::RocksDB(..) => "rocksdb",
         Error::EngineTraits(..) => "engine_traits",
@@ -42,9 +40,6 @@ pub fn error_inc(type_: &str, err: &Error) {
 pub enum Error {
     #[error("{0}")]
     Io(#[from] IoError),
-
-    #[error("{0}")]
-    Grpc(#[from] GrpcError),
 
     #[error("{0}")]
     Uuid(#[from] UuidError),
@@ -129,7 +124,6 @@ impl ErrorCodeExt for Error {
     fn error_code(&self) -> ErrorCode {
         match self {
             Error::Io(_) => error_code::sst_importer::IO,
-            Error::Grpc(_) => error_code::sst_importer::GRPC,
             Error::Uuid(_) => error_code::sst_importer::UUID,
             Error::Future(_) => error_code::sst_importer::FUTURE,
             Error::RocksDB(_) => error_code::sst_importer::ROCKSDB,
