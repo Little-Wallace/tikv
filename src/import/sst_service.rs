@@ -269,7 +269,9 @@ where
                         Ok(file)
                     })
                     .await?;
-                file.finish().map(|_| UploadResponse::default())
+                file.finish()?;
+                import.validate(meta)?;
+                Ok(UploadResponse::default())
             }
             .await;
             send_rpc_response!(res, sink, label, timer);

@@ -92,8 +92,12 @@ impl SSTImporter {
         }
     }
 
-    pub fn validate(&self, meta: &SstMeta) -> Result<SSTMetaInfo> {
+    pub fn validate(&self, meta: &SstMeta) -> Result<()> {
         self.dir.validate(meta, self.key_manager.clone())
+    }
+
+    pub fn get_meta_info(&self, meta: &SstMeta) -> Result<SSTMetaInfo> {
+        self.dir.get_meta_info(meta, self.key_manager.clone())
     }
 
     pub fn ingest<E: KvEngine>(&self, metas: &[SstMeta], engine: &E) -> Result<()> {
@@ -635,7 +639,7 @@ impl ImportDir {
         Ok(path.save.exists())
     }
 
-    fn validate(
+    fn get_meta_info(
         &self,
         meta: &SstMeta,
         key_manager: Option<Arc<DataKeyManager>>,
@@ -645,10 +649,19 @@ impl ImportDir {
         let env = get_encrypted_env(key_manager, None /*base_env*/)?;
         let env = get_inspected_env(Some(env), get_io_rate_limiter())?;
         let sst_reader = RocksSstReader::open_with_env(&path_str, Some(env))?;
-        sst_reader.verify_checksum()?;
         // TODO: check the length and crc32 of ingested file.
         let meta_info = sst_reader.sst_meta_info(meta.to_owned());
         Ok(meta_info)
+    }
+
+    fn validate(&self, meta: &SstMeta, key_manager: Option<Arc<DataKeyManager>>) -> Result<()> {
+        let path = self.join(meta)?;
+        let path_str = path.save.to_str().unwrap();
+        let env = get_encrypted_env(key_manager, None /*base_env*/)?;
+        let env = get_inspected_env(Some(env), get_io_rate_limiter())?;
+        let sst_reader = RocksSstReader::open_with_env(&path_str, Some(env))?;
+        sst_reader.verify_checksum()?;
+        Ok(())
     }
 
     fn ingest<E: KvEngine>(
@@ -1608,7 +1621,7 @@ mod tests {
 
             meta.set_length(0); // disable validation.
             meta.set_crc32(0);
-            let meta_info = importer.validate(&meta).unwrap();
+            let meta_info = importer.get_meta_info(&meta).unwrap();
             let _ = importer.ingest(&[meta], &db).unwrap();
             // key1 = "zt9102_r01", value1 = "abc", len = 13
             // key2 = "zt9102_r04", value2 = "xyz", len = 13

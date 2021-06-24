@@ -1678,7 +1678,7 @@ where
             return Err(e);
         }
 
-        match ctx.importer.validate(sst) {
+        match ctx.importer.get_meta_info(sst) {
             Ok(meta_info) => ssts.push(meta_info),
             Err(e) => {
                 // If this failed, it means that the file is corrupted or something
